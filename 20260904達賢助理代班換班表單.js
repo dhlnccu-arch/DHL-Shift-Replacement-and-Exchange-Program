@@ -1,8 +1,8 @@
 /**
  * 試算表編輯監聽器
  * 支援多列同時選取、批次拖曳填滿、Ctrl+Z/Y
- * 本版新增：全域撞班/重複值班 (Conflict) 自動防呆阻擋、
- *           排除本次待替換事件 ID、嚴格相鄰不重疊判定
+ * 本版修復：長班部分時段換出時的「殘餘時段撞班檢測」
+ *           徹底解決換班後同一人在兩處值班的分身漏洞
  */
 
 // 單次觸發最多處理的列數
@@ -149,12 +149,11 @@ function processSingleRow(sheet, calendar, row) {
       const origStartTime = combineDateTimeByStr(origDate, origStartStr);
       const origEndTime = combineDateTimeByStr(origDate, origEndStr);
 
-      // 🟡 效能優化：同一個時間窗只打一次 calendar.getEvents()，
-      // 「找原班行程」與後面的「撞班檢測」共用同一份結果在記憶體中篩選，不重複呼叫 API
+      // 快取原時段的時間窗行程
       const eventsO = getEventsForWindow(calendar, origStartTime, origEndTime);
 
       // 1. 搜尋原值班行程
-      const events1 = matchPersonEvents(eventsO, origStartTime, origEndTime, origPerson, []);
+      const events1 = matchPersonEvents(eventsO, origStartTime, origEndTime, origPerson);
       if (events1.length === 0) {
         statusCell.setValue(`錯誤：找不到 ${origPerson} 的原值班行程`);
         checkCell.setValue(false);
@@ -173,15 +172,14 @@ function processSingleRow(sheet, calendar, row) {
         return;
       }
 
-      const event1Id = events1[0].getId();
-
       // === 情況 A：雙向換班 ===
       if (isSwap) {
         const swapStartTime = combineDateTimeByStr(swapDate, swapStartStr);
         const swapEndTime = combineDateTimeByStr(swapDate, swapEndStr);
-        // 同樣道理，swap 時間窗也只抓一次，供「找互換行程」與「撞班檢測」共用
+        
+        // 快取互換時段的時間窗行程
         const eventsS = getEventsForWindow(calendar, swapStartTime, swapEndTime);
-        const events2 = matchPersonEvents(eventsS, swapStartTime, swapEndTime, targetPerson, []);
+        const events2 = matchPersonEvents(eventsS, swapStartTime, swapEndTime, targetPerson);
 
         if (events2.length === 0) {
           statusCell.setValue(`錯誤：找不到 ${targetPerson} 的互換時段行程`);
@@ -201,11 +199,9 @@ function processSingleRow(sheet, calendar, row) {
           return;
         }
 
-        const event2Id = events2[0].getId();
-
-        // 🔴 撞班檢測 1：配合換班人 (targetPerson: 以芯) 到原時段 (12:30-13:00) 是否撞班？
-        // 必須排除 event2Id (以芯自己在 13:00-14:00 準備換走的行程)
-        const conflictForTarget = matchPersonEvents(eventsO, origStartTime, origEndTime, targetPerson, [event2Id]);
+        // 🔴 撞班檢測 1：配合換班人 (targetPerson) 到原時段 (origStartTime ~ origEndTime) 是否撞班？
+        // 考慮 targetPerson 原本的班 (events2[0]) 在讓出 swap 時段後的「殘餘時段」
+        const conflictForTarget = findRealConflicts(eventsO, origStartTime, origEndTime, targetPerson, events2[0], swapStartTime, swapEndTime);
         if (conflictForTarget.length > 0) {
           const timeRangeStr = formatEventTime(conflictForTarget[0]);
           statusCell.setValue(`錯誤退件：${targetPerson} 在原值班時段已有班 (${conflictForTarget[0].getTitle()} ${timeRangeStr})`);
@@ -213,15 +209,9 @@ function processSingleRow(sheet, calendar, row) {
           return;
         }
 
-        // 🔴 撞班檢測 2：申請人 (origPerson: 怡新) 到換班時段 (13:00-14:00) 是否撞班？
-        // 必須排除 event1Id (怡新自己在 12:30-13:00 準備換走的行程)
-        const conflictForOrig = matchPersonEvents(eventsS, swapStartTime, swapEndTime, origPerson, [event1Id]);
-        
-        console.log(`[衝突偵測診斷] 檢查 ${origPerson} 在 ${swapStartTime.toLocaleTimeString()} - ${swapEndTime.toLocaleTimeString()} 是否撞班`);
-        console.log(`[衝突偵測診斷] eventsS 總共有 ${eventsS.length} 筆行程`);
-        eventsS.forEach(e => console.log(` - 候選行程: ${e.getTitle()} (${e.getStartTime().toLocaleTimeString()} - ${e.getEndTime().toLocaleTimeString()})`));
-        console.log(`[衝突偵測診斷] 命中衝突筆數: ${conflictForOrig.length}`);
-
+        // 🔴 撞班檢測 2：申請換班人 (origPerson) 到互換時段 (swapStartTime ~ swapEndTime) 是否撞班？
+        // 考慮 origPerson 原本的班 (events1[0]) 在讓出 orig 時段後的「殘餘時段」
+        const conflictForOrig = findRealConflicts(eventsS, swapStartTime, swapEndTime, origPerson, events1[0], origStartTime, origEndTime);
         if (conflictForOrig.length > 0) {
           const timeRangeStr = formatEventTime(conflictForOrig[0]);
           statusCell.setValue(`錯誤退件：${origPerson} 在互換時段已有值班 (${conflictForOrig[0].getTitle()} ${timeRangeStr})`);
@@ -263,9 +253,8 @@ function processSingleRow(sheet, calendar, row) {
 
       } else if (targetPerson && targetPerson !== "請假" && targetPerson !== "無") {
         // === 情況 B：單向代班 ===
-        // 🔴 撞班檢測：代班人 targetPerson 在代班時段是否已有其他班？
-        // 沿用上面已抓好的 eventsO（跟找原班行程同一個時間窗），不再重新打一次 calendar.getEvents()
-        const conflictForTarget = matchPersonEvents(eventsO, origStartTime, origEndTime, targetPerson, []);
+        // 代班人在該時段是否有其他衝突值班
+        const conflictForTarget = findRealConflicts(eventsO, origStartTime, origEndTime, targetPerson, null, null, null);
         if (conflictForTarget.length > 0) {
           const timeRangeStr = formatEventTime(conflictForTarget[0]);
           statusCell.setValue(`錯誤退件：${targetPerson} 在代班時段已有值班 (${conflictForTarget[0].getTitle()} ${timeRangeStr})`);
@@ -292,13 +281,7 @@ function processSingleRow(sheet, calendar, row) {
 }
 
 /**
- * 輔助函式：衝突行程偵測（排除指定 ID、嚴格排除相鄰邊界）
- * 衝突公式：startA < endB && startB < endA
- */
-/**
- * 輔助函式：抓取某時間窗前後 12 小時內的所有行程（原始、未篩選）
- * 供同一個時間窗的多種篩選（找原班行程 / 撞班檢測）共用同一次 API 呼叫，
- * 避免像先前版本一樣對同一個時間窗重複打 calendar.getEvents()
+ * 輔助函式：抓取某時間窗前後 12 小時內的所有行程
  */
 function getEventsForWindow(calendar, reqStart, reqEnd) {
   const searchStart = new Date(reqStart.getTime() - 12 * 60 * 60 * 1000);
@@ -307,23 +290,14 @@ function getEventsForWindow(calendar, reqStart, reqEnd) {
 }
 
 /**
- * 輔助函式：從一批已抓好的行程中，篩出屬於某人、且與請求時段重疊的行程
- * 這是 findOverlappingEvents 與 findConflictingEvents 共用的唯一一份重疊判定邏輯，
- * 避免同一條公式在兩個函式裡各寫一份、日後容易改一邊漏改另一邊
+ * 輔助函式：一般姓名重疊篩選（找原班行程使用）
  */
-function matchPersonEvents(events, reqStart, reqEnd, personName, excludeIds) {
-  const exclude = excludeIds || [];
+function matchPersonEvents(events, reqStart, reqEnd, personName) {
   const matched = [];
   for (let i = 0; i < events.length; i++) {
     const evt = events[i];
-
-    // 1. 排除本次交易中即將被取代的舊行程（找原班行程時 excludeIds 傳空陣列即可）
-    if (exclude.includes(evt.getId())) continue;
-
-    // 2. 姓名比對
     if (!evt.getTitle().includes(personName)) continue;
 
-    // 3. 嚴格重疊定義（相鄰不算重疊）
     const evStart = evt.getStartTime();
     const evEnd = evt.getEndTime();
     if (reqStart < evEnd && evStart < reqEnd) {
@@ -334,15 +308,49 @@ function matchPersonEvents(events, reqStart, reqEnd, personName, excludeIds) {
 }
 
 /**
- * 撞班檢測：某人在指定時段是否已有其他（非本次交易將被取代的）行程
+ * 核心輔助函式：精確衝突計算
+ * 若遇上即將被讓出的行程 (cedingEvent)，計算「讓出時段之外的殘餘時段」
+ * 只要殘餘時段仍與目標時段重疊，即判定為撞班！
  */
-function findConflictingEvents(calendar, reqStart, reqEnd, personName, excludeIds) {
-  const events = getEventsForWindow(calendar, reqStart, reqEnd);
-  return matchPersonEvents(events, reqStart, reqEnd, personName, excludeIds);
+function findRealConflicts(events, targetStart, targetEnd, personName, cedingEvent, cededStart, cededEnd) {
+  const cedingId = cedingEvent ? cedingEvent.getId() : null;
+  const conflicts = [];
+
+  for (let i = 0; i < events.length; i++) {
+    const evt = events[i];
+    if (!evt.getTitle().includes(personName)) continue;
+
+    const evStart = evt.getStartTime();
+    const evEnd = evt.getEndTime();
+
+    // 如果這筆就是準備要讓出/被切開的行程
+    if (cedingId && evt.getId() === cedingId) {
+      // 檢查前半殘餘段：evStart ~ cededStart 是否與目標時段重疊？
+      if (evStart.getTime() < cededStart.getTime()) {
+        if (targetStart < cededStart && evStart < targetEnd) {
+          conflicts.push(evt);
+          continue;
+        }
+      }
+      // 檢查後半殘餘段：cededEnd ~ evEnd 是否與目標時段重疊？
+      if (cededEnd.getTime() < evEnd.getTime()) {
+        if (targetStart < evEnd && cededEnd < targetEnd) {
+          conflicts.push(evt);
+          continue;
+        }
+      }
+    } else {
+      // 一般其他行程：標準相鄰不衝突判定
+      if (targetStart < evEnd && evStart < targetEnd) {
+        conflicts.push(evt);
+      }
+    }
+  }
+  return conflicts;
 }
 
 /**
- * 輔助函式：格式化行程起訖時間為 HH:mm-HH:mm 供錯誤訊息顯示
+ * 輔助函式：格式化行程時間為 HH:mm-HH:mm
  */
 function formatEventTime(evt) {
   const timeZone = Session.getScriptTimeZone();
@@ -516,12 +524,4 @@ function combineDateTimeByStr(dateVal, timeStr) {
 
   d.setHours(hours, minutes, 0, 0);
   return d;
-}
-
-/**
- * 輔助函式：搜尋時間上有交集、且屬於原人員的行程
- */
-function findOverlappingEvents(calendar, startTime, endTime, personName) {
-  const events = getEventsForWindow(calendar, startTime, endTime);
-  return matchPersonEvents(events, startTime, endTime, personName, []);
 }
