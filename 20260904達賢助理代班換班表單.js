@@ -203,24 +203,28 @@ function processSingleRow(sheet, calendar, row) {
 
         const event2Id = events2[0].getId();
 
-        // 🔴 撞班檢測 1：targetPerson 接下 origStartTime ~ origEndTime，是否跟自己現存的其他行程衝突？
-        // 必須排除 event2Id（若兩人在同一天換班，自己即將被換走的那筆舊班不算衝突）
-        // 沿用上面已抓好的 eventsO，不再重新打一次 calendar.getEvents()
+        // 🔴 撞班檢測 1：配合換班人 (targetPerson: 以芯) 到原時段 (12:30-13:00) 是否撞班？
+        // 必須排除 event2Id (以芯自己在 13:00-14:00 準備換走的行程)
         const conflictForTarget = matchPersonEvents(eventsO, origStartTime, origEndTime, targetPerson, [event2Id]);
         if (conflictForTarget.length > 0) {
           const timeRangeStr = formatEventTime(conflictForTarget[0]);
-          statusCell.setValue(`錯誤退件：${targetPerson} 在該時段已有值班 (${conflictForTarget[0].getTitle()} ${timeRangeStr})`);
+          statusCell.setValue(`錯誤退件：${targetPerson} 在原值班時段已有班 (${conflictForTarget[0].getTitle()} ${timeRangeStr})`);
           checkCell.setValue(false);
           return;
         }
 
-        // 🔴 撞班檢測 2：origPerson 接下 swapStartTime ~ swapEndTime，是否跟自己現存的其他行程衝突？
-        // 必須排除 event1Id（自己即將被換走的那筆舊班不算衝突）
-        // 沿用上面已抓好的 eventsS，不再重新打一次 calendar.getEvents()
+        // 🔴 撞班檢測 2：申請人 (origPerson: 怡新) 到換班時段 (13:00-14:00) 是否撞班？
+        // 必須排除 event1Id (怡新自己在 12:30-13:00 準備換走的行程)
         const conflictForOrig = matchPersonEvents(eventsS, swapStartTime, swapEndTime, origPerson, [event1Id]);
+        
+        console.log(`[衝突偵測診斷] 檢查 ${origPerson} 在 ${swapStartTime.toLocaleTimeString()} - ${swapEndTime.toLocaleTimeString()} 是否撞班`);
+        console.log(`[衝突偵測診斷] eventsS 總共有 ${eventsS.length} 筆行程`);
+        eventsS.forEach(e => console.log(` - 候選行程: ${e.getTitle()} (${e.getStartTime().toLocaleTimeString()} - ${e.getEndTime().toLocaleTimeString()})`));
+        console.log(`[衝突偵測診斷] 命中衝突筆數: ${conflictForOrig.length}`);
+
         if (conflictForOrig.length > 0) {
           const timeRangeStr = formatEventTime(conflictForOrig[0]);
-          statusCell.setValue(`錯誤退件：${origPerson} 在該時段已有值班 (${conflictForOrig[0].getTitle()} ${timeRangeStr})`);
+          statusCell.setValue(`錯誤退件：${origPerson} 在互換時段已有值班 (${conflictForOrig[0].getTitle()} ${timeRangeStr})`);
           checkCell.setValue(false);
           return;
         }
