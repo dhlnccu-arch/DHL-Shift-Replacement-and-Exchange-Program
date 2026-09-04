@@ -1,26 +1,47 @@
 /**
  * 試算表編輯監聽器
  * 支援多列同時選取、批次拖曳填滿、Ctrl+Z/Y
+ * 本版新增：換班原子性回復、必填欄位檢查、外層錯誤回饋表單、
+ *           ROW_ID 加上 side 標記、批次執行時間/列數防護
  */
+
+// 單次觸發最多處理的列數（避免一次貼上過多列導致執行超時）
+const MAX_ROWS_PER_RUN = 30;
+// Apps Script 單次執行上限約 6 分鐘，這裡抓 5 分鐘當安全煞車點（毫秒）
+const TIME_BUDGET_MS = 5 * 60 * 1000;
+
 function handleSheetEdit(e) {
   const range = e.range;
   const sheet = range.getSheet();
-  
+
   // 檢查編輯範圍是否有涵蓋到 K 欄（第 11 欄）
   const startCol = range.getColumn();
   const endCol = range.getLastColumn();
   if (startCol > 11 || endCol < 11) return;
 
   const startRow = Math.max(2, range.getRow()); // 略過標題列第 1 列
-  const endRow = range.getLastRow();
+  let endRow = range.getLastRow();
   if (startRow > endRow) return;
+
+  // 🟢 列數防護：單次觸發列數過多時，先只處理前 MAX_ROWS_PER_RUN 列，
+  // 其餘列寫提示訊息，避免一次貼上大量列造成執行逾時或狀態混亂
+  let truncated = false;
+  if (endRow - startRow + 1 > MAX_ROWS_PER_RUN) {
+    const realEndRow = endRow;
+    endRow = startRow + MAX_ROWS_PER_RUN - 1;
+    truncated = true;
+    sheet.getRange(endRow + 1, 12, realEndRow - endRow, 1)
+      .setValue(`尚未處理：單次批次上限為 ${MAX_ROWS_PER_RUN} 列，請稍後重新勾選此列（或分批操作）`);
+  }
 
   // 使用 Lock 避免高頻編輯或並行衝突
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(15000)) {
-    sheet.getRange(startRow, 12).setValue("系統忙碌中，請稍候重試");
+    sheet.getRange(startRow, 12, endRow - startRow + 1, 1).setValue("系統忙碌中，請稍候重試");
     return;
   }
+
+  const runStart = Date.now();
 
   try {
     const calendars = CalendarApp.getCalendarsByName("達賢館創新組助理值班");
@@ -32,12 +53,36 @@ function handleSheetEdit(e) {
 
     // 迴圈逐列處理（支援批次多列編輯）
     for (let r = startRow; r <= endRow; r++) {
-      processSingleRow(sheet, calendar, r);
+      // 🟢 時間防護：接近執行時間上限就提前停止，剩餘列留給下次觸發處理
+      if (Date.now() - runStart > TIME_BUDGET_MS) {
+        sheet.getRange(r, 12, endRow - r + 1, 1)
+          .setValue("尚未處理：本次執行時間已達上限，請重新勾選此列");
+        truncated = true;
+        break;
+      }
+
+      // 🟡 單列獨立 try/catch：單一列的非預期例外不會中斷其他列的處理
+      try {
+        processSingleRow(sheet, calendar, r);
+      } catch (rowErr) {
+        console.error(`第 ${r} 列處理發生非預期錯誤: ${rowErr.message}`);
+        sheet.getRange(r, 12).setValue("執行失敗（非預期錯誤）: " + rowErr.message);
+        const checkCell = sheet.getRange(r, 11);
+        if (checkCell.getValue() === true) checkCell.setValue(false);
+      }
     }
   } catch (err) {
+    // 🟡 外層真正意外（例如日曆服務整體失敗）：回饋到整個受影響範圍的 L 欄，
+    // 而不是只寫進執行紀錄讓使用者看不到
     console.error(err);
+    sheet.getRange(startRow, 12, endRow - startRow + 1, 1)
+      .setValue("系統發生錯誤，請聯絡管理員: " + err.message);
   } finally {
     lock.releaseLock();
+  }
+
+  if (truncated) {
+    console.log(`本次觸發因批次列數或時間上限而部分列未處理（範圍 ${startRow}-${range.getLastRow()}）`);
   }
 }
 
@@ -61,14 +106,29 @@ function processSingleRow(sheet, calendar, row) {
   const swapStartStr = sheet.getRange(row, 8).getDisplayValue().toString().trim();
   const swapEndStr = sheet.getRange(row, 9).getDisplayValue().toString().trim();
 
-  // 若沒填原值班人員或日期，不處理
-  if (!origPerson || !origDate) return;
+  // 🟠 必填欄位檢查：不再靜默忽略，改為明確錯誤訊息並彈回 checkbox
+  if (!origPerson || !origDate) {
+    if (isChecked) {
+      statusCell.setValue("錯誤：請填寫原值班人員與原值班日期");
+      checkCell.setValue(false);
+    }
+    return;
+  }
+  if (isChecked && (!origStartStr || !origEndStr)) {
+    statusCell.setValue("錯誤：請填寫原值班起訖時間");
+    checkCell.setValue(false);
+    return;
+  }
 
   // 統一雙向換班判定標準（嚴格對稱）
   const isSwap = Boolean(
     swapDate && swapStartStr && swapEndStr && targetPerson &&
     targetPerson !== "請假" && targetPerson !== "無"
   );
+
+  // 🟡 ROW_ID 加上 side 標記，換班兩邊分別用不同 token，避免日期相近時互相誤觸
+  const tokenA = `${row}-A`; // 原班方
+  const tokenB = `${row}-B`; // 換班對象方
 
   try {
     // ==========================================
@@ -80,13 +140,12 @@ function processSingleRow(sheet, calendar, row) {
       const origStartTime = combineDateTimeByStr(origDate, origStartStr);
       const origEndTime = combineDateTimeByStr(origDate, origEndStr);
 
-      // 帶入專屬 row ID 精確還原
-      revertEvents(calendar, origStartTime, origEndTime, origPerson, row);
+      revertEvents(calendar, origStartTime, origEndTime, origPerson, tokenA);
 
       if (isSwap) {
         const swapStartTime = combineDateTimeByStr(swapDate, swapStartStr);
         const swapEndTime = combineDateTimeByStr(swapDate, swapEndStr);
-        revertEvents(calendar, swapStartTime, swapEndTime, targetPerson, row);
+        revertEvents(calendar, swapStartTime, swapEndTime, targetPerson, tokenB);
       }
 
       statusCell.setValue("");
@@ -149,21 +208,46 @@ function processSingleRow(sheet, calendar, row) {
         const origDateStr = origDate instanceof Date ? Utilities.formatDate(origDate, Session.getScriptTimeZone(), "yyyy/MM/dd") : origDate;
         const swapDateStr = swapDate instanceof Date ? Utilities.formatDate(swapDate, Session.getScriptTimeZone(), "yyyy/MM/dd") : swapDate;
 
-        applyShiftChange(calendar, events1[0], origStartTime, origEndTime, targetPerson, origPerson, `【換班紀錄】\n- 實際到勤：${targetPerson}\n- 原定值班：${origPerson}\n- 互換對象時段：${swapDateStr}`, "[換班]", row);
-        applyShiftChange(calendar, events2[0], swapStartTime, swapEndTime, origPerson, targetPerson, `【換班紀錄】\n- 實際到勤：${origPerson}\n- 原定值班：${targetPerson}\n- 互換對象時段：${origDateStr}`, "[換班]", row);
+        // 🔴 換班原子性：兩筆改動視為一組操作，其中一筆失敗就復原另一筆已做的改動
+        let firstSideApplied = false;
+        try {
+          applyShiftChange(
+            calendar, events1[0], origStartTime, origEndTime, targetPerson, origPerson,
+            `【換班紀錄】\n- 實際到勤：${targetPerson}\n- 原定值班：${origPerson}\n- 互換對象時段：${swapDateStr}`,
+            "[換班]", tokenA
+          );
+          firstSideApplied = true;
+
+          applyShiftChange(
+            calendar, events2[0], swapStartTime, swapEndTime, origPerson, targetPerson,
+            `【換班紀錄】\n- 實際到勤：${origPerson}\n- 原定值班：${targetPerson}\n- 互換對象時段：${origDateStr}`,
+            "[換班]", tokenB
+          );
+        } catch (swapErr) {
+          // 第二筆失敗，若第一筆已經改成功，立刻復原，確保不留孤兒行程
+          if (firstSideApplied) {
+            try {
+              revertEvents(calendar, origStartTime, origEndTime, origPerson, tokenA);
+            } catch (rollbackErr) {
+              console.error(`換班回滾失敗（第 ${row} 列）: ${rollbackErr.message}`);
+              throw new Error(`換班失敗且自動回滾也失敗，請手動檢查日曆: ${swapErr.message}`);
+            }
+          }
+          throw swapErr;
+        }
 
         statusCell.setValue("已更新日曆（雙向換班完成）");
 
       } else if (targetPerson && targetPerson !== "請假" && targetPerson !== "無") {
         // === 情況 B：單向代班 ===
         const desc = `【代班紀錄】\n- 實際到勤：${targetPerson}\n- 原定值班：${origPerson}（請假由他人代班）`;
-        applyShiftChange(calendar, events1[0], origStartTime, origEndTime, targetPerson, origPerson, desc, "[代班]", row);
+        applyShiftChange(calendar, events1[0], origStartTime, origEndTime, targetPerson, origPerson, desc, "[代班]", tokenA);
         statusCell.setValue("已更新日曆（代班完成）");
 
       } else {
         // === 情況 C：純請假 ===
         const desc = `【請假紀錄】\n- 原定值班：${origPerson}（請假無人代理）`;
-        applyShiftChange(calendar, events1[0], origStartTime, origEndTime, origPerson, origPerson, desc, "【請假】", row);
+        applyShiftChange(calendar, events1[0], origStartTime, origEndTime, origPerson, origPerson, desc, "【請假】", tokenA);
         statusCell.setValue("已更新日曆（請假完成）");
       }
     }
@@ -195,19 +279,19 @@ function validateTimeRange(event, reqStart, reqEnd) {
 }
 
 /**
- * 核心函式：時段切割並寫入 ROW_ID 識別
+ * 核心函式：時段切割並寫入 ROW_ID（含 side 標記）識別
  */
-function applyShiftChange(calendar, mainEvent, subStart, subEnd, newWorker, origWorker, descText, tag, rowId) {
+function applyShiftChange(calendar, mainEvent, subStart, subEnd, newWorker, origWorker, descText, tag, rowToken) {
   const evStart = mainEvent.getStartTime();
   const evEnd = mainEvent.getEndTime();
   const floor = extractFloorSuffix(mainEvent.getTitle());
-  const rowMeta = `[ROW_ID:${rowId}]`;
+  const rowMeta = `[ROW_ID:${rowToken}]`;
 
   // 1. 完全吻合時段
   if (Math.abs(evStart.getTime() - subStart.getTime()) < 60000 && Math.abs(evEnd.getTime() - subEnd.getTime()) < 60000) {
     const newTitle = tag.startsWith("【") ? `${tag}${newWorker}${floor}` : `${newWorker}${floor} ${tag}`;
     mainEvent.setTitle(newTitle);
-    mainEvent.setDescription(`${rowMeta}\n${descText}\n--------------------\n` + cleanDescription(mainEvent.getDescription(), rowId));
+    mainEvent.setDescription(`${rowMeta}\n${descText}\n--------------------\n` + cleanDescription(mainEvent.getDescription(), rowToken));
     return;
   }
 
@@ -254,24 +338,24 @@ function applyShiftChange(calendar, mainEvent, subStart, subEnd, newWorker, orig
     return;
   }
 
-  // 綠燈保護：若未命中任何已知區間，拋出例外以避免「假成功」
+  // 若未命中任何已知區間，拋出例外以避免「假成功」（外層會據此觸發換班回滾）
   throw new Error("無法計算時段切割，請確認起訖時間是否正確");
 }
 
 /**
- * 還原函式：根據 ROW_ID 精準還原
+ * 還原函式：根據 ROW_ID（含 side 標記）精準還原
  */
-function revertEvents(calendar, rangeStart, rangeEnd, origWorker, rowId) {
+function revertEvents(calendar, rangeStart, rangeEnd, origWorker, rowToken) {
   const searchStart = new Date(rangeStart.getTime() - 24 * 60 * 60 * 1000);
   const searchEnd = new Date(rangeEnd.getTime() + 24 * 60 * 60 * 1000);
   const events = calendar.getEvents(searchStart, searchEnd);
-  const rowToken = `[ROW_ID:${rowId}]`;
+  const rowTokenTag = `[ROW_ID:${rowToken}]`;
 
   events.forEach(evt => {
     const desc = evt.getDescription() || "";
 
-    // 只處理帶有這列 ROW_ID 的行程，絕不誤傷其他排班
-    if (!desc.includes(rowToken)) return;
+    // 只處理帶有這個 side 專屬 ROW_ID 的行程，兩邊互不影響，即使日期相近也不會誤觸
+    if (!desc.includes(rowTokenTag)) return;
 
     // 1. 自動建出的子行程直接刪除
     if (desc.includes("[AUTO_SPLIT_CREATED]")) {
@@ -293,7 +377,7 @@ function revertEvents(calendar, rangeStart, rangeEnd, origWorker, rowId) {
     if (title.includes("[代班]") || title.includes("[換班]") || title.includes("【請假】")) {
       const floor = extractFloorSuffix(title);
       evt.setTitle(`${origWorker}${floor}`);
-      evt.setDescription(cleanDescription(desc, rowId));
+      evt.setDescription(cleanDescription(desc, rowToken));
     }
   });
 }
@@ -308,11 +392,12 @@ function extractFloorSuffix(title) {
 }
 
 /**
- * 輔助函式：清除特定列的備忘文字
+ * 輔助函式：清除特定 ROW_ID 的備忘文字
  */
-function cleanDescription(desc, rowId) {
+function cleanDescription(desc, rowToken) {
   if (!desc) return "";
-  let res = desc.replace(new RegExp(`\\[ROW_ID:${rowId}\\]\\n?`, "g"), "");
+  // 用純字串 replaceAll 取代 RegExp，rowToken 未來若含特殊字元也不會造成解析錯誤
+  let res = desc.replaceAll(`[ROW_ID:${rowToken}]\n`, "").replaceAll(`[ROW_ID:${rowToken}]`, "");
   res = res.replace(/【(換班|代班|請假)紀錄】[\s\S]*?--------------------\n?/g, "").trim();
   return res;
 }
