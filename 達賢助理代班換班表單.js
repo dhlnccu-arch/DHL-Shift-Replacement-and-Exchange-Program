@@ -1,17 +1,23 @@
 /**
- * 試算表編輯監聽器 v4（精簡審核版）
+ * 試算表編輯監聽器 v4.1（最終正式上線版）
  * 
  * 欄位架構對照：
- * A–J 欄：原 Google 表單資料
+ * A–J 欄：原 Google 表單資料（A:時間戳記 B:申請人 C:原班日 D:起時 E:迄時 F:配合人 G:換班日 H:換班起時 I:換班迄時 J:備註）
  * K 欄 (11)：申請人 Email
- * L 欄 (12)：☑ 執行換班（更動日曆，撞班自動退件）
+ * L 欄 (12)：☑ 審核確認 / 執行換班（管理員勾選後更動日曆，撞班自動退件）
  * M 欄 (13)：執行狀態（更新成功 / 撞班退件原因）
- * N 欄 (14)：☑ 審核通知（寄出核准信）
+ * N 欄 (14)：☑ 審核通知（管理員勾選後寄出核准信）
  * O 欄 (15)：核准通知記錄（防重複寄信）
  * P 欄 (16)：退件通知記錄（防重複寄信）
  * 
- * ⚠️ 安裝式觸發器只需 1 個：
- * 執行函式：handleSheetEdit ｜ 事件來源：來自試算表 ｜ 事件類型：編輯時
+ * ⚙️ 系統設定重點：
+ * 1. Apps Script 觸發條件（只需 1 個）：
+ *    - 執行函式：handleSheetEdit ｜ 來自試算表 ｜ 編輯時
+ * 2. 試算表必備分頁：
+ *    - 「員工名冊」：A 欄放助理姓名、B 欄放對應 Email（用於通知配合人員）
+ * 3. Google 表單原生設定：
+ *    - 「回覆」分頁點 ⋮ 勾選「收到新回覆時傳送電子郵件通知」
+ *    - 「設定」>「簡報」> 確認訊息填入：「您的換班/代班申請已成功送出！管理員審核完成後，系統將另以電子郵件通知審核結果。」
  */
 
 // 單次觸發最多處理的列數
@@ -34,15 +40,16 @@ const CONFIG = {
 
   // --- Email 相關設定 ---
   APPLICANT_EMAIL_COL: 11, // K欄：表單收集之申請人 Email
+  ADMIN_EMAILS: ["dhl.nccu@gmail.com"], // 管理員收件信箱（核准與退件信件皆會密件副本至此）
 
-  // --- 員工姓名對應 Email 名冊（雙向換班時通知互換對象） ---
+  // --- 員工姓名對應 Email 名冊（雙向換班 / 單向代班時通知配合對象） ---
   STAFF_DIRECTORY_SHEET_NAME: "員工名冊",
   STAFF_NAME_COL: 1,  // 名冊分頁：姓名欄（A=1）
   STAFF_EMAIL_COL: 2, // 名冊分頁：Email欄（B=2）
 };
 
 /**
- * 試算表編輯事件監聽器
+ * 試算表編輯事件監聽器（請綁定可安裝觸發器：來自試算表 / 編輯時）
  */
 function handleSheetEdit(e) {
   const range = e.range;
@@ -562,7 +569,7 @@ function getApplicantEmail(sheet, row) {
 }
 
 /**
- * 依姓名查詢「員工名冊」分頁中的 Email（雙向換班通知互換對象）
+ * 依姓名查詢「員工名冊」分頁中的 Email（雙向換班 / 單向代班通知對象）
  */
 function getStaffEmailByName(name) {
   if (!name) return "";
@@ -590,7 +597,7 @@ function getStaffEmailByName(name) {
 }
 
 /**
- * 統一退件處理：寫入狀態、還原 L 欄勾選框、觸發退件通知信
+ * 統一退件處理：寫入狀態、還原 L 欄勾選框、觸發退件通知信（密件副本給管理員）
  */
 function denyRow(sheet, row, checkCell, statusCell, message) {
   statusCell.setValue(message);
@@ -599,7 +606,7 @@ function denyRow(sheet, row, checkCell, statusCell, message) {
 }
 
 /**
- * 退件通知信（具備防重複發送機制）
+ * 退件通知信（具備防重複發送機制，密件副本給管理員）
  */
 function notifyRejectionIfNeeded(sheet, row, message) {
   const logCell = sheet.getRange(row, CONFIG.REJECT_LOG_COL);
@@ -613,9 +620,13 @@ function notifyRejectionIfNeeded(sheet, row, message) {
       return;
     }
     const origPerson = sheet.getRange(row, 2).getValue().toString().trim();
+    const adminBcc = (CONFIG.ADMIN_EMAILS && CONFIG.ADMIN_EMAILS.length > 0)
+      ? CONFIG.ADMIN_EMAILS.join(",")
+      : undefined;
 
     MailApp.sendEmail({
       to: email,
+      bcc: adminBcc,
       subject: "您的換班申請未通過（系統自動退件）",
       body:
 `${origPerson} 您好，
@@ -688,7 +699,7 @@ function handleApprovalEdit(sheet, row) {
 }
 
 /**
- * 審核通過 → 寄送核准信（嚴格判定 G/H/I 欄，僅雙向換班時才通知互換對象）
+ * 審核通過 → 寄送核准信（申請人、換班人、代班人皆通知，並密件副本給管理員）
  */
 function sendApprovalEmail(sheet, row) {
   const email = getApplicantEmail(sheet, row);
@@ -700,20 +711,41 @@ function sendApprovalEmail(sheet, row) {
   const origEndStr = sheet.getRange(row, 5).getDisplayValue().toString().trim();
   const targetPerson = sheet.getRange(row, 6).getValue().toString().trim();
 
+  const swapDate = sheet.getRange(row, 7).getValue();
+  const swapStartStr = sheet.getRange(row, 8).getDisplayValue().toString().trim();
+  const swapEndStr = sheet.getRange(row, 9).getDisplayValue().toString().trim();
+
   const dateStr = origDate instanceof Date
     ? Utilities.formatDate(origDate, Session.getScriptTimeZone(), "yyyy/MM/dd")
     : origDate;
 
-  const swapNote =
-    targetPerson &&
-    targetPerson !== "請假" &&
-    targetPerson !== "無"
-      ? `（對象：${targetPerson}）`
-      : "";
+  // 管理員密件副本設定
+  const adminBcc = (CONFIG.ADMIN_EMAILS && CONFIG.ADMIN_EMAILS.length > 0)
+    ? CONFIG.ADMIN_EMAILS.join(",")
+    : undefined;
 
-  // 寄給提出申請的人
+  // 判定是否為雙向互換
+  const isSwap = Boolean(
+    swapDate && swapStartStr && swapEndStr && targetPerson &&
+    targetPerson !== "請假" && targetPerson !== "無"
+  );
+
+  // 判定是否為單向代班
+  const isSub = Boolean(
+    !isSwap && targetPerson && targetPerson !== "請假" && targetPerson !== "無"
+  );
+
+  let swapNote = "";
+  if (isSwap) {
+    swapNote = `（換班對象：${targetPerson}）`;
+  } else if (isSub) {
+    swapNote = `（代班人：${targetPerson}）`;
+  }
+
+  // 1. 寄給申請人（密件副本給管理員）
   MailApp.sendEmail({
     to: email,
+    bcc: adminBcc,
     subject: "【值班換班申請】已審核通過",
     body:
 `${origPerson} 您好，
@@ -725,33 +757,44 @@ function sendApprovalEmail(sheet, row) {
 （此為系統自動發送信件，請勿直接回覆）`
   });
 
-  // 只有真正的「雙向換班」才通知互換對象
-  const swapDate = sheet.getRange(row, 7).getValue();
-  const swapStartStr = sheet.getRange(row, 8).getDisplayValue().toString().trim();
-  const swapEndStr = sheet.getRange(row, 9).getDisplayValue().toString().trim();
-
-  const isSwap = Boolean(
-    swapDate &&
-    swapStartStr &&
-    swapEndStr &&
-    targetPerson &&
-    targetPerson !== "請假" &&
-    targetPerson !== "無"
-  );
-
+  // 2. 寄給配合對象（從「員工名冊」查 Email，同樣密件副本給管理員）
   if (isSwap) {
     const targetEmail = getStaffEmailByName(targetPerson);
-
     if (targetEmail) {
+      const swapDateStr = swapDate instanceof Date
+        ? Utilities.formatDate(swapDate, Session.getScriptTimeZone(), "yyyy/MM/dd")
+        : swapDate;
+
       MailApp.sendEmail({
         to: targetEmail,
+        bcc: adminBcc,
         subject: "【值班換班申請】您的班表已完成互換",
         body:
 `${targetPerson} 您好，
 
-您與 ${origPerson} 的換班申請已審核通過，於 ${dateStr} ${origStartStr}-${origEndStr} 的值班已完成互換，新的值班安排已同步至值班日曆，請留意您的值班時間。
+您與 ${origPerson} 的換班申請已審核通過：
+- 原定班表：${swapDateStr} ${swapStartStr}-${swapEndStr}
+- 互換至：${dateStr} ${origStartStr}-${origEndStr}
 
-如對此次換班有疑問，歡迎與管理員聯繫。
+新的值班安排已同步至值班日曆，請留意您的值班時間。如有任何問題歡迎與管理員聯繫。
+
+（此為系統自動發送信件，請勿直接回覆）`
+      });
+    }
+  } else if (isSub) {
+    const targetEmail = getStaffEmailByName(targetPerson);
+    if (targetEmail) {
+      MailApp.sendEmail({
+        to: targetEmail,
+        bcc: adminBcc,
+        subject: "【值班代班通知】代班已審核通過並排入班表",
+        body:
+`${targetPerson} 您好，
+
+您協助 ${origPerson} 代班的申請已審核通過：
+- 代班時段：${dateStr} ${origStartStr}-${origEndStr}
+
+該時段班表已同步至值班日曆，請留意準時到勤。如有任何問題歡迎與管理員聯繫。
 
 （此為系統自動發送信件，請勿直接回覆）`
       });
