@@ -1,4109 +1,3583 @@
 /**
- * 助理代班／換班系統 v6.2.1（後補代班版）
+ * 達賢助理代班／換班系統 v6.3
+ * 異常復原與逐封通知版
  *
- * A–J：Google 表單資料
- * K(11)：申請人 Email
- * L(12)：審核確認／執行班表異動
- * M(13)：執行狀態
- * N(14)：審核通知
- * O(15)：核准通知記錄
- * P(16)：退件通知記錄
- * Q(17)：申請 ID（UUID，可隱藏）
+ * 取代整套舊程式，不要接在舊程式後面。
  *
- * 安裝式觸發器共 2 個：
- * 1. handleSheetEdit      → 來自試算表 → 編輯時
- * 2. onFormSubmitPrecheck → 來自試算表 → 表單提交時
+ * A–K：原表單資料
+ * L：審核確認
+ * M：執行狀態
+ * N：審核通知
+ * O：核准通知紀錄
+ * P：退件通知紀錄
+ * Q：申請 ID
  *
- * v6.2.1 重點：
- * - 表單送出先唯讀預檢；管理員勾 L 時重新讀最新 Calendar 再正式執行。
- * - 「請假（暫時找不到代班人員）」等以「請假」開頭的選項，一律視為純請假。
- * - Calendar 標題統一：姓名(樓層) [代班]／[換班]／[請假]
- * - 支援「先請假，後來找到代班人」：再次送一筆單向代班申請即可。
- * - 後補代班若取消 L，會精確恢復成原本的 [請假] 狀態，而不是正常班。
- * - 使用 UUID 作為 Calendar 事件控制識別碼，避免列排序／插刪造成串資料。
+ * Q 儲存格註解：保存異動快照
+ * O／P 儲存格註解：保存逐封寄信紀錄
+ *
+ * 請勿刪除 Q、O、P 的內容或註解。
+ * 請勿只排序部分欄位。
+ *
+ * 保留兩個安裝式觸發器：
+ *
+ * handleSheetEdit
+ * → 試算表 → 編輯時
+ *
+ * onFormSubmitPrecheck
+ * → 試算表 → 提交表單時
+ *
+ * 系統錯誤不是申請退件。
+ * API 結果不明時停住等待人工核對，
+ * 不假稱全部成功或全部還原。
+ * 郵件結果不明時也不盲目重寄。
  */
 
-const MAX_ROWS_PER_RUN = 30;
-const TIME_BUDGET_MS = 5 * 60 * 1000;
-
 const CONFIG = {
-  EXECUTE_CHECK_COL: 12, // L
-  STATUS_COL: 13,        // M
-  APPROVE_CHECK_COL: 14, // N
-  APPROVE_LOG_COL: 15,   // O
-  REJECT_LOG_COL: 16,    // P
-  REQUEST_ID_COL: 17,    // Q
+  VERSION: "6.3",
+
+  CALENDAR_NAME: "達賢館創新組助理值班",
+
+  // 有同名日曆時，才需要填入正確日曆 ID。
+  CALENDAR_ID: "",
+
+  // 空白時，依 K／L／N 欄標題辨識回覆分頁。
+  RESPONSE_SHEET_NAME: "",
+
+  TIME_ZONE: "Asia/Taipei",
+
   APPLICANT_EMAIL_COL: 11,
+  EXECUTE_CHECK_COL: 12,
+  STATUS_COL: 13,
+  APPROVE_CHECK_COL: 14,
+  APPROVE_LOG_COL: 15,
+  REJECT_LOG_COL: 16,
+  REQUEST_ID_COL: 17,
+
   ADMIN_EMAILS: ["dhl.nccu@gmail.com"],
+
   STAFF_DIRECTORY_SHEET_NAME: "員工名冊",
   STAFF_NAME_COL: 1,
-  STAFF_EMAIL_COL: 2
+  STAFF_EMAIL_COL: 2,
+
+  MAX_ROWS: 30,
+  RUN_MS: 240000,
+  NOTE_LIMIT: 45000
 };
+
+const OPEN_PHASES = [
+  "APPLYING",
+  "UNDOING",
+  "RECOVER"
+];
+
+const ACTIVE_PHASE = "APPLIED";
 
 
 // ============================================================
-// 表單提交 → 前置預檢
+// 選單與入口
+// ============================================================
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("班表工具")
+    .addItem(
+      "重試此列未完成通知",
+      "retrySelectedNotifications"
+    )
+    .addItem(
+      "核對此列不明寄信結果",
+      "resolveSelectedMail"
+    )
+    .addSeparator()
+    .addItem(
+      "復原此列中斷的班表異動",
+      "recoverSelectedCalendar"
+    )
+    .addItem(
+      "人工核對原班後解除此列鎖定",
+      "confirmSelectedRecovery"
+    )
+    .addToUi();
+}
+
+
+function isResponseSheet_(s) {
+  if (CONFIG.RESPONSE_SHEET_NAME) {
+    return s.getName() === CONFIG.RESPONSE_SHEET_NAME;
+  }
+
+  if (s.getMaxColumns() < 17) return false;
+
+  const h = s.getRange(
+    1,
+    1,
+    1,
+    17
+  ).getDisplayValues()[0];
+
+  return (
+    String(h[10]).trim() === "電子郵件地址" &&
+    String(h[11]).includes("審核確認") &&
+    String(h[13]).includes("審核通知")
+  );
+}
+
+
+function validateConfig_(s) {
+  const cols = [
+    CONFIG.APPLICANT_EMAIL_COL,
+    CONFIG.EXECUTE_CHECK_COL,
+    CONFIG.STATUS_COL,
+    CONFIG.APPROVE_CHECK_COL,
+    CONFIG.APPROVE_LOG_COL,
+    CONFIG.REJECT_LOG_COL,
+    CONFIG.REQUEST_ID_COL
+  ];
+
+  const invalid = cols.some(c =>
+    !Number.isInteger(c) ||
+    c < 1 ||
+    c > s.getMaxColumns()
+  );
+
+  if (
+    invalid ||
+    new Set(cols).size !== cols.length
+  ) {
+    throw new Error(
+      "CONFIG 欄位設定缺漏、重複或超出範圍，已停止。"
+    );
+  }
+
+  CONFIG.ADMIN_EMAILS.forEach(email => {
+    if (!validEmail_(email)) {
+      throw new Error(
+        "管理員 Email 格式不正確。"
+      );
+    }
+  });
+}
+
+
+function locked_(work) {
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(20000)) {
+    throw new Error(
+      "系統忙碌，本次未處理；稍後重新勾選或重試。"
+    );
+  }
+
+  try {
+    return work();
+
+  } finally {
+    try {
+      SpreadsheetApp.flush();
+
+    } finally {
+      lock.releaseLock();
+    }
+  }
+}
+
+
+function getCalendar_() {
+  if (CONFIG.CALENDAR_ID) {
+    const calendar = CalendarApp.getCalendarById(
+      CONFIG.CALENDAR_ID
+    );
+
+    if (!calendar) {
+      throw new Error(
+        "找不到設定的日曆或沒有存取權限。"
+      );
+    }
+
+    return calendar;
+  }
+
+  const list = CalendarApp.getCalendarsByName(
+    CONFIG.CALENDAR_NAME
+  );
+
+  if (list.length !== 1) {
+    throw new Error(
+      "指定名稱的日曆不是唯一一個，請確認名稱或設定 CALENDAR_ID。"
+    );
+  }
+
+  return list[0];
+}
+
+
+// ============================================================
+// 表單提交：只做預檢，不改班表
 // ============================================================
 
 function onFormSubmitPrecheck(e) {
-
-  if (!e || !e.range) {
-    console.error(
-      "onFormSubmitPrecheck: 找不到 e.range，請確認觸發器為『來自試算表 / 表單提交時』"
-    );
-    return;
-  }
+  if (!e || !e.range) return;
 
   const sheet = e.range.getSheet();
-  const row = e.range.getRow();
 
-  const statusCell =
-    sheet.getRange(
-      row,
-      CONFIG.STATUS_COL
-    );
-
-  const checkCell =
-    sheet.getRange(
-      row,
-      CONFIG.EXECUTE_CHECK_COL
-    );
-
-  ensureRequestId(
-    sheet,
-    row
-  );
-
-  const lock =
-    LockService.getScriptLock();
-
-  if (!lock.tryLock(15000)) {
-
-    statusCell.setValue(
-      "預檢暫時無法完成：系統忙碌，請管理員稍後確認"
-    );
-
+  if (
+    !isResponseSheet_(sheet) ||
+    e.range.getRow() < 2
+  ) {
     return;
   }
 
-  try {
+  locked_(() => {
+    validateConfig_(sheet);
 
-    const calendars =
-      CalendarApp.getCalendarsByName(
-        "達賢館創新組助理值班"
-      );
-
-    if (calendars.length === 0) {
-
-      statusCell.setValue(
-        "預檢暫時無法完成：找不到指定日曆，請管理員確認"
-      );
-
-      return;
-    }
-
-    const result =
-      analyzeRequest(
-        sheet,
-        calendars[0],
-        row
-      );
-
-    if (result.ok) {
-
-      checkCell.setValue(false);
-
-      statusCell.setValue(
-        "預檢通過，待管理員審核"
-      );
-
-      return;
-    }
-
-    checkCell.setValue(false);
-
-    const message =
-      `預檢未通過：${result.message}`;
-
-    statusCell.setValue(
-      message
-    );
-
-    notifyRejectionIfNeeded(
+    const c = context_(
       sheet,
-      row,
-      message
+      e.range.getRow()
     );
 
-  } catch (err) {
-
-    console.error(
-      `第 ${row} 列前置預檢失敗: ${err.message}`
-    );
-
-    statusCell.setValue(
-      "預檢暫時無法完成：" +
-      err.message +
-      "（請管理員確認）"
-    );
-
-  } finally {
-
-    lock.releaseLock();
-
-  }
-}
-
-
-// ============================================================
-// F 欄是否為真正的代班／換班人員
-// ============================================================
-
-function hasRealTargetPerson(value) {
-
-  const v =
-    (value || "")
-      .toString()
-      .trim();
-
-  if (!v) return false;
-
-  if (v === "無") return false;
-
-  // 「請假」
-  // 「請假（暫時找不到代班人員）」
-  // 任何以「請假」開頭的選項，都不是人名
-  if (v.startsWith("請假")) return false;
-
-  return true;
-}
-
-
-// ============================================================
-// 統一分析函式
-// 預檢與正式審核都使用這一套規則
-//
-// 注意：
-// 每次呼叫都重新讀取當下 Calendar，
-// 不會沿用之前預檢的舊結果。
-// ============================================================
-
-function analyzeRequest(
-  sheet,
-  calendar,
-  row
-) {
-
-  const origPerson =
-    sheet.getRange(row, 2)
-      .getValue()
-      .toString()
-      .trim();
-
-  const origDate =
-    sheet.getRange(row, 3)
-      .getValue();
-
-  const origStartStr =
-    sheet.getRange(row, 4)
-      .getDisplayValue()
-      .toString()
-      .trim();
-
-  const origEndStr =
-    sheet.getRange(row, 5)
-      .getDisplayValue()
-      .toString()
-      .trim();
-
-  const targetPerson =
-    sheet.getRange(row, 6)
-      .getValue()
-      .toString()
-      .trim();
-
-  const swapDate =
-    sheet.getRange(row, 7)
-      .getValue();
-
-  const swapStartStr =
-    sheet.getRange(row, 8)
-      .getDisplayValue()
-      .toString()
-      .trim();
-
-  const swapEndStr =
-    sheet.getRange(row, 9)
-      .getDisplayValue()
-      .toString()
-      .trim();
-
-
-  const base = {
-
-    row,
-
-    origPerson,
-    origDate,
-    origStartStr,
-    origEndStr,
-
-    targetPerson,
-
-    swapDate,
-    swapStartStr,
-    swapEndStr
-
-  };
-
-
-  // ==========================================================
-  // 基本資料
-  // ==========================================================
-
-  if (!origPerson || !origDate) {
-
-    return {
-
-      ...base,
-
-      ok: false,
-
-      message:
-        "請填寫原值班人員與原值班日期"
-
-    };
-  }
-
-
-  if (!origStartStr || !origEndStr) {
-
-    return {
-
-      ...base,
-
-      ok: false,
-
-      message:
-        "請填寫原值班起訖時間"
-
-    };
-  }
-
-
-  const origStartTime =
-    combineDateTimeByStr(
-      origDate,
-      origStartStr
-    );
-
-
-  const origEndTime =
-    combineDateTimeByStr(
-      origDate,
-      origEndStr
-    );
-
-
-  if (
-    !isValidTimeRange(
-      origStartTime,
-      origEndTime
-    )
-  ) {
-
-    return {
-
-      ...base,
-
-      ok: false,
-
-      message:
-        "原值班起訖時間格式不正確"
-
-    };
-  }
-
-
-  // ==========================================================
-  // 找原班
-  //
-  // 如果 Calendar 是：
-  // 王小明(4F) [請假]
-  //
-  // extractWorkerName() 仍然會得到：
-  // 王小明
-  //
-  // 所以後續找到代班人時，可以再次申請代班。
-  // ==========================================================
-
-  const eventsO =
-    getEventsForWindow(
-      calendar,
-      origStartTime,
-      origEndTime
-    );
-
-
-  const events1 =
-    matchPersonEvents(
-      eventsO,
-      origStartTime,
-      origEndTime,
-      origPerson
-    );
-
-
-  if (events1.length === 0) {
-
-    return {
-
-      ...base,
-
-      ok: false,
-
-      message:
-        `找不到 ${origPerson} 的原值班行程`
-
-    };
-  }
-
-
-  if (events1.length > 1) {
-
-    return {
-
-      ...base,
-
-      ok: false,
-
-      message:
-        `${origPerson} 同時段有多筆行程，請聯絡管理員確認`
-
-    };
-  }
-
-
-  const origEvent =
-    events1[0];
-
-
-  const check1 =
-    validateTimeRange(
-      origEvent,
-      origStartTime,
-      origEndTime
-    );
-
-
-  if (!check1.valid) {
-
-    return {
-
-      ...base,
-
-      ok: false,
-
-      message:
-        `${origPerson} 的填寫時段超出其原班表 (${check1.actualRange})`
-
-    };
-  }
-
-
-  // ==========================================================
-  // 判斷申請類型
-  // ==========================================================
-
-  const hasTarget =
-    hasRealTargetPerson(
-      targetPerson
-    );
-
-
-  const hasAnySwapField =
-    Boolean(
-      swapDate ||
-      swapStartStr ||
-      swapEndStr
-    );
-
-
-  const hasAllSwapFields =
-    Boolean(
-      swapDate &&
-      swapStartStr &&
-      swapEndStr
-    );
-
-
-  // 有人名，但 G/H/I 只填一部分
-  if (
-    hasTarget &&
-    hasAnySwapField &&
-    !hasAllSwapFields
-  ) {
-
-    return {
-
-      ...base,
-
-      ok: false,
-
-      message:
-        "配合換班日期與起訖時間填寫不完整；若為單純代班，請將配合換班日期與時間全部留白"
-
-    };
-  }
-
-
-  // 請假時不應有 G/H/I
-  if (
-    !hasTarget &&
-    hasAnySwapField
-  ) {
-
-    return {
-
-      ...base,
-
-      ok: false,
-
-      message:
-        "請假申請不需填寫配合換班日期與時間，請將 G/H/I 留白"
-
-    };
-  }
-
-
-  const isSwap =
-    Boolean(
-      hasTarget &&
-      hasAllSwapFields
-    );
-
-
-  const type =
-    isSwap
-      ? "swap"
-      : (
-          hasTarget
-            ? "sub"
-            : "leave"
+    const st = state_(c);
+
+    // 延遲或重複觸發，不得蓋掉已執行或已取消的結果。
+    if (
+      st ||
+      text_(
+        cell_(c, CONFIG.STATUS_COL).getValue()
+      ).startsWith("已更新日曆")
+    ) {
+      return;
+    }
+
+    try {
+      assertNoPending_(sheet, "");
+
+      const analysis = analyzeRequest(
+        sheet,
+        getCalendar_(),
+        row_(c)
+      );
+
+      if (!analysis.ok) {
+        reject_(c, analysis, "預檢");
+
+      } else {
+        cell_(
+          c,
+          CONFIG.EXECUTE_CHECK_COL
+        ).setValue(false);
+
+        status_(
+          c,
+          "預檢通過（" +
+          now_() +
+          "），待管理員審核"
         );
+      }
 
-
-  // 記錄原 Calendar 事件現在是正常班、請假、代班或換班
-  const origStatus =
-    getEventStatus(
-      origEvent.getTitle()
-    );
-
-
-  // ==========================================================
-  // 雙向換班
-  // ==========================================================
-
-  if (isSwap) {
-
-    const swapStartTime =
-      combineDateTimeByStr(
-        swapDate,
-        swapStartStr
+    } catch (err) {
+      status_(
+        c,
+        "預檢暫未完成，請管理員確認：" +
+        err.message
       );
-
-
-    const swapEndTime =
-      combineDateTimeByStr(
-        swapDate,
-        swapEndStr
-      );
-
-
-    if (
-      !isValidTimeRange(
-        swapStartTime,
-        swapEndTime
-      )
-    ) {
-
-      return {
-
-        ...base,
-
-        ok: false,
-
-        message:
-          "配合換班起訖時間格式不正確"
-
-      };
     }
-
-
-    const eventsS =
-      getEventsForWindow(
-        calendar,
-        swapStartTime,
-        swapEndTime
-      );
-
-
-    const events2 =
-      matchPersonEvents(
-        eventsS,
-        swapStartTime,
-        swapEndTime,
-        targetPerson
-      );
-
-
-    if (
-      events2.length === 0
-    ) {
-
-      return {
-
-        ...base,
-
-        ok: false,
-
-        message:
-          `找不到 ${targetPerson} 的互換時段行程`
-
-      };
-    }
-
-
-    if (
-      events2.length > 1
-    ) {
-
-      return {
-
-        ...base,
-
-        ok: false,
-
-        message:
-          `${targetPerson} 互換時段有多筆行程，請聯絡管理員確認`
-
-      };
-    }
-
-
-    const swapEvent =
-      events2[0];
-
-
-    const check2 =
-      validateTimeRange(
-        swapEvent,
-        swapStartTime,
-        swapEndTime
-      );
-
-
-    if (!check2.valid) {
-
-      return {
-
-        ...base,
-
-        ok: false,
-
-        message:
-          `${targetPerson} 的填寫時段超出其原班表 (${check2.actualRange})`
-
-      };
-    }
-
-
-    // 配合人要移到申請人的原班
-    const conflictForTarget =
-      findRealConflicts(
-
-        eventsO,
-
-        origStartTime,
-        origEndTime,
-
-        targetPerson,
-
-        swapEvent,
-
-        swapStartTime,
-        swapEndTime
-
-      );
-
-
-    if (
-      conflictForTarget.length > 0
-    ) {
-
-      const evt =
-        conflictForTarget[0];
-
-
-      return {
-
-        ...base,
-
-        ok: false,
-
-        message:
-          `${targetPerson} 在原值班時段已有班 (${evt.getTitle()} ${formatEventTime(evt)})`
-
-      };
-    }
-
-
-    // 申請人要移到配合人的班
-    const conflictForOrig =
-      findRealConflicts(
-
-        eventsS,
-
-        swapStartTime,
-        swapEndTime,
-
-        origPerson,
-
-        origEvent,
-
-        origStartTime,
-        origEndTime
-
-      );
-
-
-    if (
-      conflictForOrig.length > 0
-    ) {
-
-      const evt =
-        conflictForOrig[0];
-
-
-      return {
-
-        ...base,
-
-        ok: false,
-
-        message:
-          `${origPerson} 在互換時段已有值班 (${evt.getTitle()} ${formatEventTime(evt)})`
-
-      };
-    }
-
-
-    return {
-
-      ...base,
-
-      ok: true,
-
-      type,
-
-      origStatus,
-
-      origStartTime,
-      origEndTime,
-
-      swapStartTime,
-      swapEndTime,
-
-      eventsO,
-      eventsS,
-
-      origEvent,
-      swapEvent
-
-    };
-  }
-
-
-  // ==========================================================
-  // 單向代班
-  //
-  // 包括：
-  // 1. 一開始就有代班人
-  // 2. 先請假，之後才找到代班人
-  // ==========================================================
-
-  if (hasTarget) {
-
-    const conflictForTarget =
-      findRealConflicts(
-
-        eventsO,
-
-        origStartTime,
-        origEndTime,
-
-        targetPerson,
-
-        null,
-        null,
-        null
-
-      );
-
-
-    if (
-      conflictForTarget.length > 0
-    ) {
-
-      const evt =
-        conflictForTarget[0];
-
-
-      return {
-
-        ...base,
-
-        ok: false,
-
-        message:
-          `${targetPerson} 在代班時段已有值班 (${evt.getTitle()} ${formatEventTime(evt)})`
-
-      };
-    }
-  }
-
-
-  return {
-
-    ...base,
-
-    ok: true,
-
-    type,
-
-    origStatus,
-
-    origStartTime,
-    origEndTime,
-
-    eventsO,
-
-    origEvent,
-
-    swapEvent:
-      null
-
-  };
+  });
 }
 
 
 // ============================================================
-// 試算表編輯監聽器
-//
-// 如果 L 與 N 同時被編輯：
-// 一定先處理 L，再處理 N。
+// 編輯事件：同一把鎖，逐列 L 在前、N 在後
 // ============================================================
 
 function handleSheetEdit(e) {
+  if (!e || !e.range) return;
 
-  if (
-    !e ||
-    !e.range
-  ) {
+  const sheet = e.range.getSheet();
 
-    return;
-  }
+  if (!isResponseSheet_(sheet)) return;
 
+  const lo = e.range.getColumn();
+  const hi = e.range.getLastColumn();
 
-  const range =
-    e.range;
+  const touchesExecute =
+    lo <= CONFIG.EXECUTE_CHECK_COL &&
+    hi >= CONFIG.EXECUTE_CHECK_COL;
 
+  const touchesMail =
+    lo <= CONFIG.APPROVE_CHECK_COL &&
+    hi >= CONFIG.APPROVE_CHECK_COL;
 
-  const sheet =
-    range.getSheet();
+  if (!touchesExecute && !touchesMail) return;
 
+  locked_(() => {
+    validateConfig_(sheet);
 
-  const startCol =
-    range.getColumn();
-
-
-  const endCol =
-    range.getLastColumn();
-
-
-  const touchesExecuteCol =
-    !(
-      startCol >
-        CONFIG.EXECUTE_CHECK_COL ||
-
-      endCol <
-        CONFIG.EXECUTE_CHECK_COL
+    const first = Math.max(
+      2,
+      e.range.getRow()
     );
 
-
-  const touchesApproveCol =
-    !(
-      startCol >
-        CONFIG.APPROVE_CHECK_COL ||
-
-      endCol <
-        CONFIG.APPROVE_CHECK_COL
+    const last = Math.min(
+      e.range.getLastRow(),
+      sheet.getLastRow()
     );
 
+    const deadline = Date.now() + CONFIG.RUN_MS;
 
-  if (
-    !touchesExecuteCol &&
-    !touchesApproveCol
-  ) {
+    let calendar = null;
 
-    return;
-  }
-
-
-  // ==========================================================
-  // 先處理 L
-  // ==========================================================
-
-  if (
-    touchesExecuteCol
-  ) {
-
-    const startRow =
-      Math.max(
-        2,
-        range.getRow()
-      );
-
-
-    let endRow =
-      range.getLastRow();
-
-
-    if (
-      startRow >
-      endRow
-    ) {
-
-      return;
-    }
-
-
-    let truncated =
-      false;
-
-
-    if (
-      endRow -
-      startRow +
-      1 >
-      MAX_ROWS_PER_RUN
-    ) {
-
-      const realEndRow =
-        endRow;
-
-
-      endRow =
-        startRow +
-        MAX_ROWS_PER_RUN -
-        1;
-
-
-      truncated =
-        true;
-
-
-      sheet.getRange(
-
-        endRow + 1,
-
-        CONFIG.STATUS_COL,
-
-        realEndRow -
-        endRow,
-
-        1
-
-      ).setValue(
-
-        `尚未處理：單次批次上限為 ${MAX_ROWS_PER_RUN} 列，請稍後重新勾選此列（或分批操作）`
-
-      );
-    }
-
-
-    const lock =
-      LockService
-        .getScriptLock();
-
-
-    if (
-      !lock.tryLock(
-        15000
-      )
-    ) {
-
-      sheet.getRange(
-
-        startRow,
-
-        CONFIG.STATUS_COL,
-
-        endRow -
-        startRow +
-        1,
-
-        1
-
-      ).setValue(
-
-        "系統忙碌中，請稍候重試"
-
-      );
-
-
-      return;
-    }
-
-
-    const runStart =
-      Date.now();
-
-
-    try {
-
-      const calendars =
-        CalendarApp
-          .getCalendarsByName(
-            "達賢館創新組助理值班"
-          );
-
-
+    for (let r = first; r <= last; r++) {
       if (
-        calendars.length === 0
+        r - first >= CONFIG.MAX_ROWS ||
+        Date.now() > deadline - 30000
       ) {
-
-        sheet.getRange(
-
-          startRow,
-
-          CONFIG.STATUS_COL,
-
-          endRow -
-          startRow +
-          1,
-
-          1
-
-        ).setValue(
-
-          "錯誤：找不到指定日曆"
-
+        sheet.getParent().toast(
+          "部分列尚未處理，請分批重新操作；未覆寫既有狀態。"
         );
 
-
-        return;
+        break;
       }
-
-
-      const calendar =
-        calendars[0];
-
-
-      for (
-        let r = startRow;
-        r <= endRow;
-        r++
-      ) {
-
-        if (
-          Date.now() -
-          runStart >
-          TIME_BUDGET_MS
-        ) {
-
-          sheet.getRange(
-
-            r,
-
-            CONFIG.STATUS_COL,
-
-            endRow -
-            r +
-            1,
-
-            1
-
-          ).setValue(
-
-            "尚未處理：本次執行時間已達上限，請重新勾選此列"
-
-          );
-
-
-          truncated =
-            true;
-
-
-          break;
-        }
-
-
-        try {
-
-          processSingleRow(
-            sheet,
-            calendar,
-            r
-          );
-
-
-        } catch (rowErr) {
-
-          console.error(
-            `第 ${r} 列處理發生非預期錯誤: ${rowErr.message}`
-          );
-
-
-          sheet.getRange(
-            r,
-            CONFIG.STATUS_COL
-          ).setValue(
-
-            "執行失敗（非預期錯誤）: " +
-            rowErr.message
-
-          );
-
-
-          const checkCell =
-            sheet.getRange(
-              r,
-              CONFIG.EXECUTE_CHECK_COL
-            );
-
-
-          if (
-            checkCell.getValue() ===
-            true
-          ) {
-
-            checkCell.setValue(
-              false
-            );
-          }
-        }
-      }
-
-
-    } catch (err) {
-
-      console.error(
-        err
-      );
-
-
-      sheet.getRange(
-
-        startRow,
-
-        CONFIG.STATUS_COL,
-
-        endRow -
-        startRow +
-        1,
-
-        1
-
-      ).setValue(
-
-        "系統發生錯誤，請聯絡管理員: " +
-        err.message
-
-      );
-
-
-    } finally {
-
-      lock.releaseLock();
-
-    }
-
-
-    if (
-      truncated
-    ) {
-
-      console.log(
-
-        `本次觸發因批次列數或時間上限而部分列未處理（範圍 ${startRow}-${range.getLastRow()}）`
-
-      );
-    }
-  }
-
-
-  // ==========================================================
-  // L 完成後再處理 N
-  // ==========================================================
-
-  if (
-    touchesApproveCol
-  ) {
-
-    handleApprovalEditRange(
-      sheet,
-      range
-    );
-  }
-}
-
-
-// ============================================================
-// 正式處理單筆申請
-// ============================================================
-
-function processSingleRow(
-  sheet,
-  calendar,
-  row
-) {
-
-  const checkCell =
-    sheet.getRange(
-      row,
-      CONFIG.EXECUTE_CHECK_COL
-    );
-
-
-  const statusCell =
-    sheet.getRange(
-      row,
-      CONFIG.STATUS_COL
-    );
-
-
-  const isChecked =
-    checkCell.getValue() ===
-    true;
-
-
-  const statusVal =
-    statusCell
-      .getValue()
-      .toString();
-
-
-  try {
-
-    // ========================================================
-    // L 被取消
-    // → 還原「這一筆申請」造成的 Calendar 異動
-    // ========================================================
-
-    if (
-      !isChecked
-    ) {
 
       if (
-        !statusVal.includes(
-          "已更新日曆"
+        !text_(
+          sheet.getRange(r, 2).getValue()
         )
       ) {
-
-        return;
+        continue;
       }
 
-
-      const origPerson =
-        sheet.getRange(row, 2)
-          .getValue()
-          .toString()
-          .trim();
-
-
-      const origDate =
-        sheet.getRange(row, 3)
-          .getValue();
-
-
-      const origStartStr =
-        sheet.getRange(row, 4)
-          .getDisplayValue()
-          .toString()
-          .trim();
-
-
-      const origEndStr =
-        sheet.getRange(row, 5)
-          .getDisplayValue()
-          .toString()
-          .trim();
-
-
-      const targetPerson =
-        sheet.getRange(row, 6)
-          .getValue()
-          .toString()
-          .trim();
-
-
-      const swapDate =
-        sheet.getRange(row, 7)
-          .getValue();
-
-
-      const swapStartStr =
-        sheet.getRange(row, 8)
-          .getDisplayValue()
-          .toString()
-          .trim();
-
-
-      const swapEndStr =
-        sheet.getRange(row, 9)
-          .getDisplayValue()
-          .toString()
-          .trim();
-
-
-      const tokenBase =
-        getRequestTokenBase(
-          sheet,
-          row,
-          true
-        );
-
-
-      const tokenA =
-        `${tokenBase}-A`;
-
-
-      const tokenB =
-        `${tokenBase}-B`;
-
-
-      const origStartTime =
-        combineDateTimeByStr(
-          origDate,
-          origStartStr
-        );
-
-
-      const origEndTime =
-        combineDateTimeByStr(
-          origDate,
-          origEndStr
-        );
-
-
-      revertEvents(
-
-        calendar,
-
-        origStartTime,
-        origEndTime,
-
-        origPerson,
-
-        tokenA
-
-      );
-
-
-      const isSwap =
-        Boolean(
-
-          hasRealTargetPerson(
-            targetPerson
-          ) &&
-
-          swapDate &&
-          swapStartStr &&
-          swapEndStr
-
-        );
-
-
-      if (
-        isSwap
-      ) {
-
-        const swapStartTime =
-          combineDateTimeByStr(
-            swapDate,
-            swapStartStr
-          );
-
-
-        const swapEndTime =
-          combineDateTimeByStr(
-            swapDate,
-            swapEndStr
-          );
-
-
-        revertEvents(
-
-          calendar,
-
-          swapStartTime,
-          swapEndTime,
-
-          targetPerson,
-
-          tokenB
-
-        );
-      }
-
-
-      statusCell.setValue(
-        ""
-      );
-
-
-      return;
-    }
-
-
-    // 已經執行成功過
-    if (
-      statusVal.includes(
-        "已更新日曆"
-      )
-    ) {
-
-      return;
-    }
-
-
-    // ========================================================
-    // 正式審核
-    //
-    // 每次勾 L 都重新讀最新 Calendar。
-    // ========================================================
-
-    const analysis =
-      analyzeRequest(
-        sheet,
-        calendar,
-        row
-      );
-
-
-    if (
-      !analysis.ok
-    ) {
-
-      denyRow(
-
-        sheet,
-
-        row,
-
-        checkCell,
-        statusCell,
-
-        `正式審核未通過：${analysis.message}`
-
-      );
-
-
-      return;
-    }
-
-
-    const tokenBase =
-      getRequestTokenBase(
-        sheet,
-        row,
-        false
-      );
-
-
-    const tokenA =
-      `${tokenBase}-A`;
-
-
-    const tokenB =
-      `${tokenBase}-B`;
-
-
-    // ========================================================
-    // 雙向換班
-    // ========================================================
-
-    if (
-      analysis.type ===
-      "swap"
-    ) {
-
-      const origDateStr =
-        formatDateValue(
-          analysis.origDate
-        );
-
-
-      const swapDateStr =
-        formatDateValue(
-          analysis.swapDate
-        );
-
-
-      let firstSideApplied =
-        false;
-
+      let c;
 
       try {
+        c = context_(sheet, r);
 
-        applyShiftChange(
+        if (touchesExecute) {
+          calendar = calendar || getCalendar_();
 
-          calendar,
-
-          analysis.origEvent,
-
-          analysis.origStartTime,
-          analysis.origEndTime,
-
-          analysis.targetPerson,
-          analysis.origPerson,
-
-          `【換班紀錄】
-- 實際到勤：${analysis.targetPerson}
-- 原定值班：${analysis.origPerson}
-- 互換對象時段：${swapDateStr}`,
-
-          "[換班]",
-
-          tokenA
-
-        );
-
-
-        firstSideApplied =
-          true;
-
-
-        applyShiftChange(
-
-          calendar,
-
-          analysis.swapEvent,
-
-          analysis.swapStartTime,
-          analysis.swapEndTime,
-
-          analysis.origPerson,
-          analysis.targetPerson,
-
-          `【換班紀錄】
-- 實際到勤：${analysis.origPerson}
-- 原定值班：${analysis.targetPerson}
-- 互換對象時段：${origDateStr}`,
-
-          "[換班]",
-
-          tokenB
-
-        );
-
-
-      } catch (swapErr) {
-
-        if (
-          firstSideApplied
-        ) {
-
-          try {
-
-            revertEvents(
-
-              calendar,
-
-              analysis.origStartTime,
-              analysis.origEndTime,
-
-              analysis.origPerson,
-
-              tokenA
-
-            );
-
-
-          } catch (
-            rollbackErr
-          ) {
-
-            console.error(
-
-              `換班回滾失敗（第 ${row} 列）: ${rollbackErr.message}`
-
-            );
-
-
-            throw new Error(
-
-              `換班失敗且自動回滾也失敗，請手動檢查日曆: ${swapErr.message}`
-
-            );
-          }
+          processSingleRow_(
+            c,
+            calendar
+          );
         }
 
+        // L 執行完，才處理同列 N。
+        if (
+          touchesMail &&
+          cell_(
+            c,
+            CONFIG.APPROVE_CHECK_COL
+          ).getValue() === true
+        ) {
+          approval_(
+            c,
+            deadline
+          );
+        }
 
-        throw swapErr;
+      } catch (err) {
+        console.error(err);
+
+        // 不把已成功狀態改成失敗。
+        // 操作錯誤寫入 L 儲存格註解。
+        sheet.getRange(
+          r,
+          CONFIG.EXECUTE_CHECK_COL
+        ).setNote(
+          "本次未完成：" + err.message
+        );
+
+        sheet.getParent().toast(
+          "第 " + r + " 列：" + err.message
+        );
       }
-
-
-      statusCell.setValue(
-        "已更新日曆（雙向換班完成）"
-      );
-
-
-      return;
     }
-
-
-    // ========================================================
-    // 單向代班
-    //
-    // 如果 origStatus === leave：
-    // 代表原事件已經是：
-    // 王小明(4F) [請假]
-    //
-    // 這次就是「後補代班」。
-    // ========================================================
-
-    if (
-      analysis.type ===
-      "sub"
-    ) {
-
-      const isLaterSubstitute =
-        analysis.origStatus ===
-        "leave";
-
-
-      const desc =
-        isLaterSubstitute
-
-          ? `【代班紀錄】
-- 實際到勤：${analysis.targetPerson}
-- 原定值班：${analysis.origPerson}
-- 原狀態：已請假，後續找到代班人`
-
-          : `【代班紀錄】
-- 實際到勤：${analysis.targetPerson}
-- 原定值班：${analysis.origPerson}（請假由他人代班）`;
-
-
-      applyShiftChange(
-
-        calendar,
-
-        analysis.origEvent,
-
-        analysis.origStartTime,
-        analysis.origEndTime,
-
-        analysis.targetPerson,
-        analysis.origPerson,
-
-        desc,
-
-        "[代班]",
-
-        tokenA
-
-      );
-
-
-      statusCell.setValue(
-
-        isLaterSubstitute
-
-          ? "已更新日曆（後補代班完成）"
-
-          : "已更新日曆（代班完成）"
-
-      );
-
-
-      return;
-    }
-
-
-    // ========================================================
-    // 純請假
-    // ========================================================
-
-    const desc =
-      `【請假紀錄】
-- 原定值班：${analysis.origPerson}（請假無人代理）`;
-
-
-    applyShiftChange(
-
-      calendar,
-
-      analysis.origEvent,
-
-      analysis.origStartTime,
-      analysis.origEndTime,
-
-      analysis.origPerson,
-      analysis.origPerson,
-
-      desc,
-
-      "[請假]",
-
-      tokenA
-
-    );
-
-
-    statusCell.setValue(
-      "已更新日曆（請假完成）"
-    );
-
-
-  } catch (err) {
-
-    const failMsg =
-      "執行失敗: " +
-      err.message;
-
-
-    statusCell.setValue(
-      failMsg
-    );
-
-
-    if (
-      isChecked
-    ) {
-
-      checkCell.setValue(
-        false
-      );
-
-
-      notifyRejectionIfNeeded(
-        sheet,
-        row,
-        failMsg
-      );
-    }
-  }
+  });
 }
 
 
 // ============================================================
-// Calendar 查詢
+// 共用工具：UUID、狀態、快照
 // ============================================================
 
-function getEventsForWindow(
-  calendar,
-  reqStart,
-  reqEnd
-) {
-
-  const searchStart =
-    new Date(
-
-      reqStart.getTime() -
-
-      12 *
-      60 *
-      60 *
-      1000
-
-    );
+function text_(value) {
+  return value == null
+    ? ""
+    : String(value).trim();
+}
 
 
-  const searchEnd =
-    new Date(
-
-      reqEnd.getTime() +
-
-      12 *
-      60 *
-      60 *
-      1000
-
-    );
-
-
-  return calendar.getEvents(
-    searchStart,
-    searchEnd
+function clone_(value) {
+  return JSON.parse(
+    JSON.stringify(value)
   );
 }
 
 
-// ============================================================
-// 精準姓名比對
-// ============================================================
-
-function matchPersonEvents(
-  events,
-  reqStart,
-  reqEnd,
-  personName
-) {
-
-  const matched =
-    [];
+function now_() {
+  return Utilities.formatDate(
+    new Date(),
+    CONFIG.TIME_ZONE,
+    "yyyy/MM/dd HH:mm:ss"
+  );
+}
 
 
-  for (
-    let i = 0;
-    i < events.length;
-    i++
-  ) {
-
-    const evt =
-      events[i];
-
-
-    if (
-      extractWorkerName(
-        evt.getTitle()
-      ) !==
-      personName
-    ) {
-
-      continue;
-    }
+function hash_(value) {
+  return Utilities.base64EncodeWebSafe(
+    Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      JSON.stringify(value)
+    )
+  );
+}
 
 
-    const evStart =
-      evt.getStartTime();
+function readNote_(cell, kind) {
+  const text = cell.getNote();
+
+  if (!text) return null;
+
+  let value;
+
+  try {
+    value = JSON.parse(text);
+
+  } catch (_) {
+    throw new Error(
+      "系統註解不是有效的 JSON，請勿覆寫或刪除原紀錄。"
+    );
+  }
+
+  if (value.kind !== kind) {
+    throw new Error(
+      "系統註解類型不符，已停止以保護紀錄。"
+    );
+  }
+
+  return value;
+}
 
 
-    const evEnd =
-      evt.getEndTime();
+function writeNote_(cell, value) {
+  const text = JSON.stringify(value);
+
+  if (text.length > CONFIG.NOTE_LIMIT) {
+    throw new Error(
+      "快照／通知紀錄過大，請管理員封存處理。"
+    );
+  }
+
+  cell.setNote(text);
+
+  SpreadsheetApp.flush();
+}
 
 
-    if (
-      reqStart <
-      evEnd &&
+function context_(sheet, r) {
+  const q = sheet.getRange(
+    r,
+    CONFIG.REQUEST_ID_COL
+  );
 
-      evStart <
-      reqEnd
-    ) {
+  let id = text_(q.getValue());
 
-      matched.push(
-        evt
+  const oldStatus = text_(
+    sheet.getRange(
+      r,
+      CONFIG.STATUS_COL
+    ).getValue()
+  );
+
+  if (!id) {
+    if (oldStatus.includes("已更新日曆")) {
+      throw new Error(
+        "此舊案件沒有 UUID，不能猜測舊列號還原；請人工核對日曆。"
       );
     }
+
+    id = Utilities.getUuid();
+
+    q.setValue(id);
+
+    SpreadsheetApp.flush();
   }
 
+  const c = {
+    s: sheet,
+    r: r,
+    id: id
+  };
 
-  return matched;
+  // 同時檢查 UUID 是否重複。
+  row_(c);
+
+  return c;
 }
 
 
-// ============================================================
-// 撞班判斷
-// ============================================================
+function row_(c) {
+  const lastRow = c.s.getLastRow();
 
-function findRealConflicts(
+  const values = lastRow > 1
+    ? c.s.getRange(
+        2,
+        CONFIG.REQUEST_ID_COL,
+        lastRow - 1,
+        1
+      ).getValues()
+    : [];
 
-  events,
+  const matches = [];
 
-  targetStart,
-  targetEnd,
-
-  personName,
-
-  cedingEvent,
-
-  cededStart,
-  cededEnd
-
-) {
-
-  const cedingId =
-    cedingEvent
-      ? cedingEvent.getId()
-      : null;
-
-
-  const conflicts =
-    [];
-
-
-  for (
-    let i = 0;
-    i < events.length;
-    i++
-  ) {
-
-    const evt =
-      events[i];
-
-
-    if (
-      extractWorkerName(
-        evt.getTitle()
-      ) !==
-      personName
-    ) {
-
-      continue;
+  values.forEach((value, index) => {
+    if (text_(value[0]) === c.id) {
+      matches.push(index + 2);
     }
+  });
+
+  if (matches.length !== 1) {
+    throw new Error(
+      "申請 ID 遺失或重複，請勿複製 Q 欄。"
+    );
+  }
+
+  c.r = matches[0];
+
+  return c.r;
+}
 
 
-    const evStart =
-      evt.getStartTime();
+function cell_(c, col) {
+  return c.s.getRange(
+    row_(c),
+    col
+  );
+}
 
 
-    const evEnd =
-      evt.getEndTime();
+function status_(c, message) {
+  cell_(
+    c,
+    CONFIG.STATUS_COL
+  ).setValue(message);
+}
 
 
-    // 即將讓出的行程
-    if (
-      cedingId &&
-      evt.getId() ===
-      cedingId
-    ) {
+function state_(c) {
+  const st = readNote_(
+    cell_(
+      c,
+      CONFIG.REQUEST_ID_COL
+    ),
+    "shift-tx"
+  );
 
-      // 前半段殘餘
-      if (
-        evStart.getTime() <
-        cededStart.getTime()
-      ) {
+  if (st && st.id !== c.id) {
+    throw new Error(
+      "申請 ID 與快照不一致。"
+    );
+  }
 
-        if (
-          targetStart <
-          cededStart &&
-
-          evStart <
-          targetEnd
-        ) {
-
-          conflicts.push(
-            evt
-          );
-
-          continue;
-        }
-      }
+  return st;
+}
 
 
-      // 後半段殘餘
-      if (
-        cededEnd.getTime() <
-        evEnd.getTime()
-      ) {
+function saveState_(c, st) {
+  st.updated = now_();
 
-        if (
-          targetStart <
-          evEnd &&
-
-          cededEnd <
-          targetEnd
-        ) {
-
-          conflicts.push(
-            evt
-          );
-
-          continue;
-        }
-      }
+  writeNote_(
+    cell_(
+      c,
+      CONFIG.REQUEST_ID_COL
+    ),
+    st
+  );
+}
 
 
-    } else if (
+// 若有其他未完成的日曆異動，暫停新的正式異動。
+function assertNoPending_(sheet, ownId) {
+  if (sheet.getLastRow() < 2) return;
 
-      targetStart <
-      evEnd &&
+  const notes = sheet.getRange(
+    2,
+    CONFIG.REQUEST_ID_COL,
+    sheet.getLastRow() - 1,
+    1
+  ).getNotes();
 
-      evStart <
-      targetEnd
+  notes.forEach((entry, index) => {
+    if (!entry[0]) return;
 
-    ) {
+    let st;
 
-      conflicts.push(
-        evt
+    try {
+      st = JSON.parse(entry[0]);
+
+    } catch (_) {
+      throw new Error(
+        "第 " +
+        (index + 2) +
+        " 列 Q 註解異常，請先核對。"
       );
     }
-  }
 
-
-  return conflicts;
+    if (
+      st.kind === "shift-tx" &&
+      OPEN_PHASES.includes(st.phase) &&
+      st.id !== ownId
+    ) {
+      throw new Error(
+        "第 " +
+        (index + 2) +
+        " 列異動尚待復原，暫停其他班表異動。"
+      );
+    }
+  });
 }
 
 
 // ============================================================
-// Calendar 標題處理
+// 讀取申請與嚴格時間解析
 // ============================================================
 
-function extractWorkerName(
-  title
-) {
-
-  let name =
-    (title || "")
-      .toString()
-      .trim();
-
-
-  // 王小明(4F) [代班]
-  // 王小明(4F) [換班]
-  // 王小明(4F) [請假]
-  name =
-    name.replace(
-      /\s*\[(換班|代班|請假)\]\s*$/,
-      ""
-    );
-
-
-  // 移除樓層
-  name =
-    name.replace(
-      /\s*(\([^\)]*\)|（[^）]*）)\s*$/,
-      ""
-    );
-
-
-  return name.trim();
-}
-
-
-function extractFloorSuffix(
-  title
-) {
-
-  const pureTitle =
-    (title || "")
-      .toString()
-      .replace(
-        /\s*\[(換班|代班|請假)\]\s*$/g,
-        ""
-      )
-      .trim();
-
-
-  const match =
-    pureTitle.match(
-      /(\([^\)]+\)|（[^）]+）)$/
-    );
-
-
-  return match
-    ? match[0]
-    : "";
-}
-
-
-function getEventStatus(
-  title
-) {
-
-  const t =
-    (title || "")
-      .toString()
-      .trim();
-
-
-  if (
-    /\[請假\]\s*$/.test(
-      t
-    )
-  ) {
-
-    return "leave";
-  }
-
-
-  if (
-    /\[代班\]\s*$/.test(
-      t
-    )
-  ) {
-
-    return "sub";
-  }
-
-
-  if (
-    /\[換班\]\s*$/.test(
-      t
-    )
-  ) {
-
-    return "swap";
-  }
-
-
-  return "normal";
-}
-
-
-function buildShiftTitle(
-  worker,
-  floor,
-  tag
-) {
-
-  return `${worker}${floor} ${tag}`;
-}
-
-
-// ============================================================
-// 時間是否合法
-// ============================================================
-
-function isValidTimeRange(
-  start,
-  end
-) {
+function hasRealTargetPerson(value) {
+  value = text_(value);
 
   return (
-
-    start instanceof Date &&
-
-    end instanceof Date &&
-
-    !isNaN(
-      start.getTime()
-    ) &&
-
-    !isNaN(
-      end.getTime()
-    ) &&
-
-    start <
-    end
-
+    !!value &&
+    value !== "無" &&
+    !value.startsWith("請假")
   );
 }
 
 
-// ============================================================
-// UUID
-// ============================================================
+function readRequest_(sheet, r) {
+  const values = sheet.getRange(
+    r,
+    1,
+    1,
+    11
+  ).getValues()[0];
 
-function ensureRequestId(
-  sheet,
-  row
-) {
+  const display = sheet.getRange(
+    r,
+    1,
+    1,
+    11
+  ).getDisplayValues()[0];
 
-  const cell =
-    sheet.getRange(
-      row,
-      CONFIG.REQUEST_ID_COL
-    );
-
-
-  let id =
-    cell.getValue()
-      .toString()
-      .trim();
-
-
-  if (
-    !id
-  ) {
-
-    id =
-      Utilities.getUuid();
-
-
-    cell.setValue(
-      id
-    );
-  }
-
-
-  return id;
-}
-
-
-// ============================================================
-// Calendar ROW_ID 基底
-// ============================================================
-
-function getRequestTokenBase(
-  sheet,
-  row,
-  legacyForExisting
-) {
-
-  const cell =
-    sheet.getRange(
-      row,
-      CONFIG.REQUEST_ID_COL
-    );
-
-
-  const existing =
-    cell.getValue()
-      .toString()
-      .trim();
-
-
-  if (
-    existing
-  ) {
-
-    return existing;
-  }
-
-
-  // 舊資料相容
-  if (
-    legacyForExisting
-  ) {
-
-    return String(
-      row
-    );
-  }
-
-
-  return ensureRequestId(
-    sheet,
-    row
-  );
-}
-
-
-// ============================================================
-// 顯示 Calendar 時段
-// ============================================================
-
-function formatEventTime(
-  evt
-) {
-
-  const timeZone =
-    Session.getScriptTimeZone();
-
-
-  const s =
-    Utilities.formatDate(
-
-      evt.getStartTime(),
-
-      timeZone,
-
-      "HH:mm"
-
-    );
-
-
-  const e =
-    Utilities.formatDate(
-
-      evt.getEndTime(),
-
-      timeZone,
-
-      "HH:mm"
-
-    );
-
-
-  return `${s}-${e}`;
-}
-
-
-function formatDateValue(
-  value
-) {
-
-  return value instanceof Date
-
+  const date = value => value instanceof Date
     ? Utilities.formatDate(
-
         value,
-
-        Session.getScriptTimeZone(),
-
+        CONFIG.TIME_ZONE,
         "yyyy/MM/dd"
-
       )
-
-    : value;
-}
-
-
-// ============================================================
-// 確認申請時段是否在原事件內
-// ============================================================
-
-function validateTimeRange(
-  event,
-  reqStart,
-  reqEnd
-) {
-
-  const evStart =
-    event.getStartTime()
-      .getTime();
-
-
-  const evEnd =
-    event.getEndTime()
-      .getTime();
-
-
-  const s =
-    reqStart.getTime();
-
-
-  const e =
-    reqEnd.getTime();
-
-
-  const timeZone =
-    Session.getScriptTimeZone();
-
-
-  const actualStartStr =
-    Utilities.formatDate(
-
-      event.getStartTime(),
-
-      timeZone,
-
-      "HH:mm"
-
-    );
-
-
-  const actualEndStr =
-    Utilities.formatDate(
-
-      event.getEndTime(),
-
-      timeZone,
-
-      "HH:mm"
-
-    );
-
-
-  const actualRange =
-    `${actualStartStr}-${actualEndStr}`;
-
-
-  if (
-
-    s <
-    evStart -
-    60000 ||
-
-    e >
-    evEnd +
-    60000
-
-  ) {
-
-    return {
-
-      valid:
-        false,
-
-      actualRange
-
-    };
-  }
-
+    : text_(value);
 
   return {
-
-    valid:
-      true,
-
-    actualRange
-
+    person: text_(values[1]),
+    date: date(values[2]),
+    start: text_(display[3]),
+    end: text_(display[4]),
+    target: text_(values[5]),
+    swapDate: date(values[6]),
+    swapStart: text_(display[7]),
+    swapEnd: text_(display[8]),
+    memo: text_(values[9])
   };
 }
 
 
-// ============================================================
-// 原始狀態封存
-//
-// 這是 v6.2 最重要的新增設計之一。
-// 把修改前完整的 Calendar title / description 封存起來。
-//
-// 因此：
-//
-// 王小明(4F) [請假]
-// ↓ 後補代班
-// 李小華(4F) [代班]
-//
-// 如果取消後補代班：
-//
-// 李小華(4F) [代班]
-// ↓
-// 王小明(4F) [請假]
-//
-// 可以精確恢復。
-// ============================================================
-
-function encodeMetaText(
-  text
-) {
-
-  return Utilities.base64EncodeWebSafe(
-
-    (text || "")
-      .toString(),
-
-    Utilities.Charset.UTF_8
-
+function parseTime_(date, time) {
+  const dateMatch = text_(date).match(
+    /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/
   );
-}
 
+  const timeMatch = text_(time)
+    .replace(/：/g, ":")
+    .match(
+      /^(上午|下午|AM|PM)?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i
+    );
 
-function decodeMetaText(
-  encoded
-) {
-
-  if (
-    !encoded
-  ) {
-
-    return "";
+  if (!dateMatch || !timeMatch) {
+    throw new Error(
+      "日期或時間格式錯誤，請用日期及 HH:mm。"
+    );
   }
 
+  let hour = Number(timeMatch[2]);
+  const minute = Number(timeMatch[3]);
+  const second = Number(timeMatch[4] || 0);
 
-  return Utilities.newBlob(
+  const ampm = text_(
+    timeMatch[1] || timeMatch[5]
+  ).toUpperCase();
 
-    Utilities.base64DecodeWebSafe(
-      encoded
-    )
+  if (
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    (ampm && (hour < 1 || hour > 12))
+  ) {
+    throw new Error(
+      "時間超出合法範圍。"
+    );
+  }
 
-  ).getDataAsString(
-    "UTF-8"
+  if (ampm) {
+    hour =
+      hour % 12 +
+      (
+        ampm === "PM" ||
+        ampm === "下午"
+          ? 12
+          : 0
+      );
+  }
+
+  const pad = value =>
+    String(Number(value)).padStart(2, "0");
+
+  const input =
+    `${dateMatch[1]}/${pad(dateMatch[2])}/${pad(dateMatch[3])} ` +
+    `${pad(hour)}:${pad(minute)}:${pad(second)}`;
+
+  const result = Utilities.parseDate(
+    input,
+    CONFIG.TIME_ZONE,
+    "yyyy/MM/dd HH:mm:ss"
+  );
+
+  if (
+    Utilities.formatDate(
+      result,
+      CONFIG.TIME_ZONE,
+      "yyyy/MM/dd HH:mm:ss"
+    ) !== input
+  ) {
+    throw new Error(
+      "日期不存在。"
+    );
+  }
+
+  return result;
+}
+
+
+// ============================================================
+// Calendar 標題解析
+// ============================================================
+
+function titleInfo_(title) {
+  let raw = text_(title);
+
+  const tag = raw.match(
+    /\s*\[(換班|代班|請假)\]\s*$/
+  );
+
+  const state = tag ? tag[1] : "";
+
+  if (tag) {
+    raw = raw.slice(
+      0,
+      tag.index
+    ).trim();
+  }
+
+  const floor = raw.match(
+    /(\([^)]*\)|（[^）]*）)$/
+  );
+
+  return {
+    name: (
+      floor
+        ? raw.slice(0, floor.index)
+        : raw
+    ).trim(),
+
+    floor: floor
+      ? floor[0]
+      : "",
+
+    state: state
+  };
+}
+
+
+function overlap_(start1, end1, start2, end2) {
+  return (
+    start1 < end2 &&
+    start2 < end1
   );
 }
 
 
-// 移除前一層事件的系統控制標記。
-// 真正原始內容會另外完整封存在 ORIG_DESC_B64。
-function stripControlMetadata(
-  desc
+// ============================================================
+// 共用檢核：每次重新查當下 Calendar
+// ============================================================
+
+function analyzeRequest(sheet, calendar, r) {
+  const req = readRequest_(
+    sheet,
+    r
+  );
+
+  const reject = (code, message) => ({
+    ok: false,
+    code: code,
+    message: message,
+    req: req
+  });
+
+  const hasTarget = hasRealTargetPerson(
+    req.target
+  );
+
+  const anySwap = !!(
+    req.swapDate ||
+    req.swapStart ||
+    req.swapEnd
+  );
+
+  const allSwap = !!(
+    req.swapDate &&
+    req.swapStart &&
+    req.swapEnd
+  );
+
+  if (
+    !req.person ||
+    !req.date ||
+    !req.start ||
+    !req.end
+  ) {
+    return reject(
+      "MISSING",
+      "請填寫申請人、原值班日期與起訖時間。"
+    );
+  }
+
+  if (
+    hasTarget &&
+    req.person === req.target
+  ) {
+    return reject(
+      "SELF",
+      "申請人與配合人不能是同一人。"
+    );
+  }
+
+  if (
+    hasTarget &&
+    anySwap &&
+    !allSwap
+  ) {
+    return reject(
+      "PARTIAL",
+      "雙向換班的 G/H/I 請完整填寫；單向代班請全部留白。"
+    );
+  }
+
+  if (
+    !hasTarget &&
+    anySwap
+  ) {
+    return reject(
+      "LEAVE_FIELDS",
+      "純請假的 G/H/I 請全部留白。"
+    );
+  }
+
+  let originalStart;
+  let originalEnd;
+  let swapStart;
+  let swapEnd;
+
+  try {
+    originalStart = parseTime_(
+      req.date,
+      req.start
+    );
+
+    originalEnd = parseTime_(
+      req.date,
+      req.end
+    );
+
+    if (!(originalStart < originalEnd)) {
+      throw new Error(
+        "原班結束時間必須晚於開始時間，不支援跨日填法。"
+      );
+    }
+
+    if (hasTarget && allSwap) {
+      swapStart = parseTime_(
+        req.swapDate,
+        req.swapStart
+      );
+
+      swapEnd = parseTime_(
+        req.swapDate,
+        req.swapEnd
+      );
+
+      if (!(swapStart < swapEnd)) {
+        throw new Error(
+          "互換結束時間必須晚於開始時間。"
+        );
+      }
+    }
+
+  } catch (err) {
+    return reject(
+      "TIME",
+      err.message
+    );
+  }
+
+  const findPerson = (
+    events,
+    name,
+    start,
+    end
+  ) => events.filter(event =>
+    titleInfo_(
+      event.getTitle()
+    ).name === name &&
+    overlap_(
+      +start,
+      +end,
+      +event.getStartTime(),
+      +event.getEndTime()
+    )
+  );
+
+  const originalEvents = calendar.getEvents(
+    originalStart,
+    originalEnd
+  );
+
+  const originalMatches = findPerson(
+    originalEvents,
+    req.person,
+    originalStart,
+    originalEnd
+  );
+
+  if (originalMatches.length !== 1) {
+    return reject(
+      "ORIGINAL",
+      originalMatches.length
+        ? req.person + " 同時段有多筆行程，請管理員確認。"
+        : "找不到 " + req.person + " 的原值班行程。"
+    );
+  }
+
+  const contained = (
+    event,
+    start,
+    end
+  ) => (
+    !event.isAllDayEvent() &&
+    +start >= +event.getStartTime() &&
+    +end <= +event.getEndTime()
+  );
+
+  const originalEvent = originalMatches[0];
+
+  if (
+    !contained(
+      originalEvent,
+      originalStart,
+      originalEnd
+    )
+  ) {
+    return reject(
+      "RANGE",
+      "申請時段超出原班，或原班是全天事件。"
+    );
+  }
+
+  const type = hasTarget
+    ? (allSwap ? "swap" : "sub")
+    : "leave";
+
+  let swapEvent = null;
+
+  if (type === "swap") {
+    const targetEvents = calendar.getEvents(
+      swapStart,
+      swapEnd
+    );
+
+    const targetMatches = findPerson(
+      targetEvents,
+      req.target,
+      swapStart,
+      swapEnd
+    );
+
+    if (targetMatches.length !== 1) {
+      return reject(
+        "TARGET",
+        "配合人互換時段的班表不存在或不唯一。"
+      );
+    }
+
+    swapEvent = targetMatches[0];
+
+    if (
+      !contained(
+        swapEvent,
+        swapStart,
+        swapEnd
+      )
+    ) {
+      return reject(
+        "TARGET_RANGE",
+        "互換時段超出配合人原班。"
+      );
+    }
+
+    const targetConflict = hasConflict_(
+      originalEvents,
+      req.target,
+      originalStart,
+      originalEnd,
+      swapEvent,
+      swapStart,
+      swapEnd
+    );
+
+    const originalConflict = hasConflict_(
+      targetEvents,
+      req.person,
+      swapStart,
+      swapEnd,
+      originalEvent,
+      originalStart,
+      originalEnd
+    );
+
+    if (
+      targetConflict ||
+      originalConflict
+    ) {
+      return reject(
+        "CONFLICT_SWAP",
+        "雙向換班後與既有值班／請假紀錄或殘餘時段衝突。"
+      );
+    }
+
+  } else if (
+    hasTarget &&
+    hasConflict_(
+      originalEvents,
+      req.target,
+      originalStart,
+      originalEnd,
+      null,
+      null,
+      null
+    )
+  ) {
+    return reject(
+      "CONFLICT_SUB",
+      req.target + " 在代班時段已有值班／請假紀錄。"
+    );
+  }
+
+  return {
+    ok: true,
+    req: req,
+    type: type,
+    orig: originalEvent,
+    swap: swapEvent,
+
+    os: +originalStart,
+    oe: +originalEnd,
+
+    ss: swapStart
+      ? +swapStart
+      : null,
+
+    se: swapEnd
+      ? +swapEnd
+      : null,
+
+    late:
+      type === "sub" &&
+      titleInfo_(
+        originalEvent.getTitle()
+      ).state === "請假"
+  };
+}
+
+
+function hasConflict_(
+  events,
+  name,
+  start,
+  end,
+  cedingEvent,
+  cededStart,
+  cededEnd
 ) {
+  return events.some(event => {
+    if (
+      titleInfo_(
+        event.getTitle()
+      ).name !== name
+    ) {
+      return false;
+    }
 
-  return (desc || "")
+    const eventStart = +event.getStartTime();
+    const eventEnd = +event.getEndTime();
 
-    .toString()
+    // 重複行程的 iCalUID 可能相同，
+    // 所以還要比對該次行程的開始／結束時間。
+    const sameEvent = (
+      cedingEvent &&
+      event.getId() === cedingEvent.getId() &&
+      eventStart === +cedingEvent.getStartTime() &&
+      eventEnd === +cedingEvent.getEndTime()
+    );
 
+    if (!sameEvent) {
+      return overlap_(
+        +start,
+        +end,
+        eventStart,
+        eventEnd
+      );
+    }
+
+    const frontConflict = (
+      eventStart < +cededStart &&
+      overlap_(
+        +start,
+        +end,
+        eventStart,
+        +cededStart
+      )
+    );
+
+    const backConflict = (
+      +cededEnd < eventEnd &&
+      overlap_(
+        +start,
+        +end,
+        +cededEnd,
+        eventEnd
+      )
+    );
+
+    return frontConflict || backConflict;
+  });
+}
+
+
+// ============================================================
+// 中繼資料、快照與修改計畫
+// ============================================================
+
+function enc_(text) {
+  return Utilities.base64EncodeWebSafe(
+    text,
+    Utilities.Charset.UTF_8
+  );
+}
+
+
+function dec_(text) {
+  return Utilities.newBlob(
+    Utilities.base64DecodeWebSafe(text)
+  ).getDataAsString("UTF-8");
+}
+
+
+function meta_(description, key) {
+  const match = String(
+    description || ""
+  ).match(
+    new RegExp(
+      "^\\[" +
+      key +
+      ":([^\\]\\r\\n]*)\\]\\s*$",
+      "m"
+    )
+  );
+
+  return match ? match[1] : null;
+}
+
+
+// 找出目前事件依賴的前序申請。
+// 同時讀取 v6.2 的 Base64 快照鏈。
+function owners_(description, depth) {
+  depth = depth || 0;
+
+  if (depth > 20) {
+    throw new Error(
+      "舊快照層數過多，請人工核對。"
+    );
+  }
+
+  const result = [];
+
+  const own = meta_(
+    description,
+    "ROW_ID"
+  );
+
+  if (own) result.push(own);
+
+  const parents = meta_(
+    description,
+    "ANCESTORS_B64"
+  );
+
+  if (parents) {
+    result.push(
+      ...JSON.parse(
+        dec_(parents)
+      )
+    );
+  }
+
+  const previous = meta_(
+    description,
+    "ORIG_DESC_B64"
+  );
+
+  if (previous) {
+    result.push(
+      ...owners_(
+        dec_(previous),
+        depth + 1
+      )
+    );
+  }
+
+  return [...new Set(result)];
+}
+
+
+function humanDesc_(description) {
+  return String(description || "")
     .replace(
-      /^\[AUTO_SPLIT_CREATED\]\n?/gm,
+      /^\[(?:ROW_ID|ANCESTORS_B64|PART_ID|ORIG_TITLE_B64|ORIG_DESC_B64|SPLIT_ORIG_TIME):[^\]\r\n]*\]\r?\n?/gm,
       ""
     )
-
     .replace(
-      /^\[ROW_ID:[^\]]+\]\n?/gm,
+      /^\[AUTO_SPLIT_CREATED\]\r?\n?/gm,
       ""
     )
-
-    .replace(
-      /^\[ORIG_TITLE_B64:[^\]]*\]\n?/gm,
-      ""
-    )
-
-    .replace(
-      /^\[ORIG_DESC_B64:[^\]]*\]\n?/gm,
-      ""
-    )
-
-    .replace(
-      /^\[SPLIT_ORIG_TIME:\d+-\d+\]\n?/gm,
-      ""
-    )
-
     .trim();
 }
 
 
-function buildControlHeader(
-
-  rowToken,
-
-  originalTitle,
-  originalDescription,
-
-  evStart,
-  evEnd,
-
-  includeSplitTime
-
-) {
-
-  const parts =
-    [
-
-      `[ROW_ID:${rowToken}]`,
-
-      `[ORIG_TITLE_B64:${encodeMetaText(originalTitle)}]`,
-
-      `[ORIG_DESC_B64:${encodeMetaText(originalDescription)}]`
-
-    ];
+function snap_(event) {
+  return {
+    id: event.getId(),
+    s: +event.getStartTime(),
+    e: +event.getEndTime(),
+    title: event.getTitle(),
+    desc: event.getDescription() || "",
+    location: event.getLocation() || ""
+  };
+}
 
 
-  if (
-    includeSplitTime
-  ) {
-
-    parts.push(
-
-      `[SPLIT_ORIG_TIME:${evStart.getTime()}-${evEnd.getTime()}]`
-
-    );
-  }
-
-
-  return parts.join(
-    "\n"
+function same_(a, b) {
+  return (
+    a.s === b.s &&
+    a.e === b.e &&
+    a.title === b.title &&
+    a.desc === b.desc &&
+    a.location === b.location
   );
 }
 
 
-// ============================================================
-// 套用班表異動
-// ============================================================
-
-function applyShiftChange(
-
-  calendar,
-
-  mainEvent,
-
-  subStart,
-  subEnd,
-
-  newWorker,
-  origWorker,
-
-  descText,
-
-  tag,
-
-  rowToken
-
-) {
-
-  const evStart =
-    mainEvent.getStartTime();
+// 中途 setter 失敗時，各欄位可能停在修改前或修改後。
+// 只允許本次修改可解釋的組合，避免覆寫外部手動修改。
+function compatible_(current, before, after) {
+  return (
+    [before.title, after.title].includes(current.title) &&
+    [before.desc, after.desc].includes(current.desc) &&
+    (
+      (
+        current.s === before.s &&
+        current.e === before.e
+      ) ||
+      (
+        current.s === after.s &&
+        current.e === after.e
+      )
+    ) &&
+    current.location === before.location
+  );
+}
 
 
-  const evEnd =
-    mainEvent.getEndTime();
-
-
-  const originalTitle =
-    mainEvent.getTitle();
-
-
-  const originalDescription =
-    mainEvent.getDescription() ||
-    "";
-
-
-  const inheritedDescription =
-    stripControlMetadata(
-      originalDescription
-    );
-
-
-  const floor =
-    extractFloorSuffix(
-      originalTitle
-    );
-
-
-  const rowMeta =
-    `[ROW_ID:${rowToken}]`;
-
-
-  const newTitle =
-    buildShiftTitle(
-      newWorker,
-      floor,
-      tag
-    );
-
-
-  // ==========================================================
-  // 整段吻合
-  // ==========================================================
-
+function putSnapshot_(event, target) {
   if (
-
-    Math.abs(
-      evStart.getTime() -
-      subStart.getTime()
-    ) <
-    60000 &&
-
-    Math.abs(
-      evEnd.getTime() -
-      subEnd.getTime()
-    ) <
-    60000
-
+    +event.getStartTime() !== target.s ||
+    +event.getEndTime() !== target.e
   ) {
+    event.setTime(
+      new Date(target.s),
+      new Date(target.e)
+    );
+  }
 
-    const controlHeader =
-      buildControlHeader(
+  if (event.getTitle() !== target.title) {
+    event.setTitle(target.title);
+  }
 
-        rowToken,
+  // 說明最後寫，保留控制標記直到其他屬性完成。
+  if (
+    (event.getDescription() || "") !== target.desc
+  ) {
+    event.setDescription(target.desc);
+  }
+}
 
-        originalTitle,
-        originalDescription,
 
-        evStart,
-        evEnd,
+function plan_(
+  event,
+  start,
+  end,
+  worker,
+  tag,
+  token,
+  detail
+) {
+  const before = snap_(event);
+  const after = clone_(before);
 
-        false
+  const ancestry = owners_(before.desc);
 
+  const header =
+    `[ROW_ID:${token}]\n` +
+    `[ANCESTORS_B64:${enc_(JSON.stringify(ancestry))}]`;
+
+  const human = humanDesc_(before.desc);
+
+  const title =
+    `${worker}${titleInfo_(before.title).floor} [${tag}]`;
+
+  const additions = [];
+
+  const add = (
+    partStart,
+    partEnd,
+    partTitle,
+    body
+  ) => {
+    const key =
+      token + ":" + (additions.length + 1);
+
+    additions.push({
+      key: key,
+      stage: "NEW",
+      id: "",
+
+      want: {
+        s: partStart,
+        e: partEnd,
+        title: partTitle,
+        location: before.location,
+
+        desc:
+          `[AUTO_SPLIT_CREATED]\n` +
+          `${header}\n` +
+          `[PART_ID:${key}]\n` +
+          body
+      }
+    });
+
+    additions[
+      additions.length - 1
+    ].want.desc = additions[
+      additions.length - 1
+    ].want.desc.trim();
+  };
+
+  // 整段異動
+  if (
+    start === before.s &&
+    end === before.e
+  ) {
+    after.title = title;
+
+    after.desc =
+      `${header}\n` +
+      `${detail}\n` +
+      `--------------------\n` +
+      human;
+
+    after.desc = after.desc.trim();
+
+  } else {
+    after.desc = `${header}\n${human}`.trim();
+
+    // 切中間或後半
+    if (start > before.s) {
+      after.e = start;
+
+      add(
+        start,
+        end,
+        title,
+        detail + "\n" + human
       );
 
-
-    mainEvent.setTitle(
-      newTitle
-    );
-
-
-    mainEvent.setDescription(
-
-      `${controlHeader}
-${descText}
---------------------
-${inheritedDescription}`.trim()
-
-    );
-
-
-    return;
-  }
-
-
-  const controlHeader =
-    buildControlHeader(
-
-      rowToken,
-
-      originalTitle,
-      originalDescription,
-
-      evStart,
-      evEnd,
-
-      true
-
-    );
-
-
-  // ==========================================================
-  // 切中間
-  // ==========================================================
-
-  if (
-
-    subStart.getTime() >
-    evStart.getTime() &&
-
-    subEnd.getTime() <
-    evEnd.getTime()
-
-  ) {
-
-    mainEvent.setTime(
-      evStart,
-      subStart
-    );
-
-
-    mainEvent.setDescription(
-
-      `${controlHeader}
-${inheritedDescription}`.trim()
-
-    );
-
-
-    calendar.createEvent(
-
-      newTitle,
-
-      subStart,
-      subEnd,
-
-      {
-
-        description:
-
-`[AUTO_SPLIT_CREATED]
-${rowMeta}
-${descText}
---------------------
-${inheritedDescription}`.trim()
-
+      if (end < before.e) {
+        add(
+          end,
+          before.e,
+          before.title,
+          human
+        );
       }
 
-    );
+    } else {
+      // 切前半
+      after.s = end;
 
-
-    // 後半段維持原本狀態。
-    //
-    // 如果原本是：
-    // 王小明(4F) [請假]
-    //
-    // 後半段就仍然是：
-    // 王小明(4F) [請假]
-    //
-    // 不會變回正常班。
-    calendar.createEvent(
-
-      originalTitle,
-
-      subEnd,
-      evEnd,
-
-      {
-
-        description:
-
-`[AUTO_SPLIT_CREATED]
-${rowMeta}
-${inheritedDescription}`.trim()
-
-      }
-
-    );
-
-
-    return;
+      add(
+        start,
+        end,
+        title,
+        detail + "\n" + human
+      );
+    }
   }
 
+  return {
+    token: token,
+    before: before,
+    after: after,
+    additions: additions,
+    touched: false,
+    restored: false
+  };
+}
 
-  // ==========================================================
-  // 切後半
-  // ==========================================================
 
-  if (
+function appliedText_(st) {
+  const label =
+    st.type === "swap"
+      ? "雙向換班"
+      : st.type === "leave"
+        ? "請假"
+        : st.late
+          ? "後補代班"
+          : "代班";
 
-    subStart.getTime() >
-    evStart.getTime() &&
+  return "已更新日曆（" + label + "完成）";
+}
 
-    Math.abs(
-      subEnd.getTime() -
-      evEnd.getTime()
-    ) <
-    60000
 
-  ) {
+function newTransaction_(c, calendar, analysis) {
+  const tx = Utilities.getUuid();
 
-    mainEvent.setTime(
-      evStart,
-      subStart
+  const base = c.id + "-" + tx;
+
+  const tag =
+    analysis.type === "leave"
+      ? "請假"
+      : analysis.type === "swap"
+        ? "換班"
+        : "代班";
+
+  const firstWorker =
+    analysis.type === "leave"
+      ? analysis.req.person
+      : analysis.req.target;
+
+  const plans = [
+    plan_(
+      analysis.orig,
+      analysis.os,
+      analysis.oe,
+      firstWorker,
+      tag,
+      base + "-A",
+
+      `【${tag}紀錄】\n` +
+      `- 原定值班：${analysis.req.person}\n` +
+      `- 實際安排：${firstWorker}\n` +
+      `- 申請 ID：${c.id}`
+    )
+  ];
+
+  if (analysis.type === "swap") {
+    plans.push(
+      plan_(
+        analysis.swap,
+        analysis.ss,
+        analysis.se,
+        analysis.req.person,
+        tag,
+        base + "-B",
+
+        `【換班紀錄】\n` +
+        `- 原定值班：${analysis.req.target}\n` +
+        `- 實際到勤：${analysis.req.person}\n` +
+        `- 申請 ID：${c.id}`
+      )
     );
-
-
-    mainEvent.setDescription(
-
-      `${controlHeader}
-${inheritedDescription}`.trim()
-
-    );
-
-
-    calendar.createEvent(
-
-      newTitle,
-
-      subStart,
-      subEnd,
-
-      {
-
-        description:
-
-`[AUTO_SPLIT_CREATED]
-${rowMeta}
-${descText}
---------------------
-${inheritedDescription}`.trim()
-
-      }
-
-    );
-
-
-    return;
   }
 
+  return {
+    kind: "shift-tx",
+    version: CONFIG.VERSION,
 
-  // ==========================================================
-  // 切前半
-  // ==========================================================
+    id: c.id,
+    tx: tx,
 
-  if (
+    phase: "APPLYING",
+    calendar: calendar.getId(),
 
-    Math.abs(
-      subStart.getTime() -
-      evStart.getTime()
-    ) <
-    60000 &&
+    req: analysis.req,
+    requestHash: hash_(analysis.req),
 
-    subEnd.getTime() <
-    evEnd.getTime()
+    type: analysis.type,
+    late: analysis.late,
 
-  ) {
+    plans: plans,
 
-    mainEvent.setTime(
-      subEnd,
-      evEnd
-    );
-
-
-    mainEvent.setDescription(
-
-      `${controlHeader}
-${inheritedDescription}`.trim()
-
-    );
-
-
-    calendar.createEvent(
-
-      newTitle,
-
-      subStart,
-      subEnd,
-
-      {
-
-        description:
-
-`[AUTO_SPLIT_CREATED]
-${rowMeta}
-${descText}
---------------------
-${inheritedDescription}`.trim()
-
-      }
-
-    );
-
-
-    return;
-  }
-
-
-  throw new Error(
-
-    "無法計算時段切割，請確認起訖時間是否正確"
-
-  );
+    purpose: "rollback",
+    error: ""
+  };
 }
 
 
 // ============================================================
-// 還原 Calendar
-//
-// 新版優先使用：
-//
-// ORIG_TITLE_B64
-// ORIG_DESC_B64
-//
-// 精確恢復修改前的狀態。
+// 正式異動與失敗補償
 // ============================================================
 
-function revertEvents(
+function processSingleRow_(c, calendar) {
+  let st = state_(c);
 
-  calendar,
+  const checked = cell_(
+    c,
+    CONFIG.EXECUTE_CHECK_COL
+  ).getValue() === true;
 
-  rangeStart,
-  rangeEnd,
-
-  origWorker,
-
-  rowToken
-
-) {
-
-  const searchStart =
-    new Date(
-
-      rangeStart.getTime() -
-
-      24 *
-      60 *
-      60 *
-      1000
-
-    );
-
-
-  const searchEnd =
-    new Date(
-
-      rangeEnd.getTime() +
-
-      24 *
-      60 *
-      60 *
-      1000
-
-    );
-
-
-  const events =
-    calendar.getEvents(
-      searchStart,
-      searchEnd
-    );
-
-
-  const rowTokenTag =
-    `[ROW_ID:${rowToken}]`;
-
-
-  // ==========================================================
-  // 先刪除這次切割產生的新事件
-  // ==========================================================
-
-  for (
-    let i = events.length - 1;
-    i >= 0;
-    i--
+  if (
+    st &&
+    OPEN_PHASES.includes(st.phase)
   ) {
+    throw new Error(
+      "此列有中斷異動，請用「班表工具→復原此列中斷的班表異動」。"
+    );
+  }
 
-    const evt =
-      events[i];
+  assertNoPending_(
+    c.s,
+    c.id
+  );
+
+  const oldStatus = text_(
+    cell_(
+      c,
+      CONFIG.STATUS_COL
+    ).getValue()
+  );
+
+  // 已執行的舊版案件：只有取消時才嘗試安全匯入。
+  if (
+    !st &&
+    oldStatus.startsWith("已更新日曆")
+  ) {
+    if (checked) return;
+
+    try {
+      st = adoptLegacy_(
+        c,
+        calendar
+      );
+
+    } catch (err) {
+      cell_(
+        c,
+        CONFIG.EXECUTE_CHECK_COL
+      ).setValue(true);
+
+      throw err;
+    }
+  }
+
+  // 已執行成功
+  if (
+    st &&
+    st.phase === ACTIVE_PHASE
+  ) {
+    if (checked) {
+      status_(
+        c,
+        appliedText_(st)
+      );
+
+      return;
+    }
+
+    // 取消 L：先完整檢查，通過才做任何刪除／還原。
+    try {
+      const events = eventsForTx_(
+        calendar,
+        st
+      );
+
+      preflightUndo_(
+        st,
+        events
+      );
+
+      st.phase = "UNDOING";
+      st.purpose = "undo";
+
+      saveState_(
+        c,
+        st
+      );
+
+      restoreTransaction_(
+        c,
+        calendar,
+        st,
+        events,
+        false
+      );
+
+      finishRestore_(
+        c,
+        st
+      );
+
+    } catch (err) {
+      if (st.phase === "APPLIED") {
+        cell_(
+          c,
+          CONFIG.EXECUTE_CHECK_COL
+        ).setValue(true);
+
+        cell_(
+          c,
+          CONFIG.EXECUTE_CHECK_COL
+        ).setNote(
+          "取消未執行：" + err.message
+        );
+
+        status_(
+          c,
+          appliedText_(st) +
+          "；取消未執行：" +
+          err.message
+        );
+
+      } else {
+        markRecovery_(
+          c,
+          st,
+          err
+        );
+      }
+    }
+
+    return;
+  }
+
+  if (!checked) return;
+
+  // 已成功後又取消的案件，不重用原列。
+  if (
+    st &&
+    st.phase === "UNDONE"
+  ) {
+    cell_(
+      c,
+      CONFIG.EXECUTE_CHECK_COL
+    ).setValue(false);
+
+    throw new Error(
+      "這筆已取消並保留歷史紀錄；再次申請請另填一筆表單。"
+    );
+  }
+
+  const analysis = analyzeRequest(
+    c.s,
+    calendar,
+    row_(c)
+  );
+
+  if (!analysis.ok) {
+    reject_(
+      c,
+      analysis,
+      "正式審核"
+    );
+
+    return;
+  }
+
+  st = newTransaction_(
+    c,
+    calendar,
+    analysis
+  );
+
+  // 必須先成功保存快照，才開始改 Calendar。
+  saveState_(
+    c,
+    st
+  );
+
+  const references = [
+    analysis.orig,
+    analysis.swap
+  ];
+
+  try {
+    for (
+      let index = 0;
+      index < st.plans.length;
+      index++
+    ) {
+      const p = st.plans[index];
+      const event = references[index];
+
+      if (
+        !same_(
+          snap_(event),
+          p.before
+        )
+      ) {
+        throw new Error(
+          "原事件已變動，停止本次異動。"
+        );
+      }
+
+      p.touched = true;
+
+      saveState_(
+        c,
+        st
+      );
+
+      putSnapshot_(
+        event,
+        p.after
+      );
+
+      for (const addition of p.additions) {
+        addition.stage = "CREATING";
+
+        saveState_(
+          c,
+          st
+        );
+
+        let created;
+
+        try {
+          created = calendar.createEvent(
+            addition.want.title,
+            new Date(addition.want.s),
+            new Date(addition.want.e),
+            {
+              description: addition.want.desc,
+              location: addition.want.location
+            }
+          );
+
+        } catch (err) {
+          // 明確被拒絕的呼叫，沒有建立事件。
+          // 其他錯誤保留 CREATING，等待核對。
+          const definitelyRejected =
+            /permission|authorization|quota|too many times|invalid (argument|date|time)/i
+              .test(err.message);
+
+          if (definitelyRejected) {
+            addition.stage = "NEW";
+
+            saveState_(
+              c,
+              st
+            );
+          }
+
+          throw err;
+        }
+
+        addition.id = created.getId();
+        addition.stage = "CREATED";
+
+        saveState_(
+          c,
+          st
+        );
+      }
+    }
+
+    st.phase = ACTIVE_PHASE;
+
+    saveState_(
+      c,
+      st
+    );
+
+    status_(
+      c,
+      appliedText_(st)
+    );
+
+    cell_(
+      c,
+      CONFIG.EXECUTE_CHECK_COL
+    ).setNote("");
+
+  } catch (err) {
+    st.error = err.message;
+    st.purpose = "rollback";
+    st.phase = "RECOVER";
+
+    try {
+      saveState_(
+        c,
+        st
+      );
+
+      restoreTransaction_(
+        c,
+        calendar,
+        st,
+        eventsForTx_(calendar, st),
+        false
+      );
+
+      finishRestore_(
+        c,
+        st
+      );
+
+    } catch (recoveryError) {
+      markRecovery_(
+        c,
+        st,
+        recoveryError
+      );
+    }
+  }
+}
 
 
-    const desc =
-      evt.getDescription() ||
-      "";
+// ============================================================
+// 還原前檢查與復原
+// ============================================================
 
+function eventsForTx_(calendar, st) {
+  if (calendar.getId() !== st.calendar) {
+    throw new Error(
+      "日曆 ID 與原異動紀錄不同。"
+    );
+  }
+
+  const points = st.plans.flatMap(p => [
+    p.before.s,
+    p.before.e,
+
+    ...p.additions.flatMap(addition => [
+      addition.want.s,
+      addition.want.e
+    ])
+  ]);
+
+  return calendar.getEvents(
+    new Date(
+      Math.min(...points) - 86400000
+    ),
+    new Date(
+      Math.max(...points) + 86400000
+    )
+  );
+}
+
+
+function mainEvent_(p, events) {
+  const candidates = events.filter(event =>
+    event.getId() === p.before.id &&
+    (
+      (
+        +event.getStartTime() === p.before.s ||
+        +event.getStartTime() === p.after.s
+      ) ||
+      meta_(
+        event.getDescription(),
+        "ROW_ID"
+      ) === p.token
+    )
+  );
+
+  if (candidates.length !== 1) {
+    throw new Error(
+      "原主事件不存在或不唯一，不能安全還原。"
+    );
+  }
+
+  return candidates[0];
+}
+
+
+function addedEvent_(addition, events) {
+  const candidates = events.filter(event =>
+    meta_(
+      event.getDescription(),
+      "PART_ID"
+    ) === addition.key ||
+    (
+      addition.id &&
+      event.getId() === addition.id &&
+      +event.getStartTime() === addition.want.s
+    )
+  );
+
+  if (candidates.length > 1) {
+    throw new Error(
+      "新增事件識別碼重複，請人工核對。"
+    );
+  }
+
+  return candidates[0] || null;
+}
+
+
+// 有後續依賴時，不允許先取消原申請。
+function checkDependents_(tokens, events) {
+  for (const event of events) {
+    const description =
+      event.getDescription() || "";
+
+    const top = meta_(
+      description,
+      "ROW_ID"
+    );
 
     if (
-      !desc.includes(
-        rowTokenTag
+      top &&
+      !tokens.includes(top) &&
+      owners_(
+        description
+      ).some(token => tokens.includes(token))
+    ) {
+      throw new Error(
+        "仍有後補代班／後續異動「" +
+        event.getTitle() +
+        "」，請先取消後續申請。"
+      );
+    }
+  }
+}
+
+
+// 還原也要避免與後來新增的其他班表撞班。
+function checkRestoreConflicts_(st, events) {
+  const tokens = st.plans.map(
+    p => p.token
+  );
+
+  const outside = events.filter(event => {
+    if (
+      tokens.includes(
+        meta_(
+          event.getDescription(),
+          "ROW_ID"
+        )
       )
     ) {
+      return false;
+    }
 
+    return !st.plans.some(p =>
+      (
+        event.getId() === p.before.id &&
+        [
+          +p.before.s,
+          +p.after.s
+        ].includes(
+          +event.getStartTime()
+        )
+      ) ||
+      p.additions.some(addition =>
+        addition.id &&
+        event.getId() === addition.id &&
+        +event.getStartTime() === addition.want.s
+      )
+    );
+  });
+
+  for (const p of st.plans) {
+    const name = titleInfo_(
+      p.before.title
+    ).name;
+
+    const conflict = outside.some(event =>
+      titleInfo_(
+        event.getTitle()
+      ).name === name &&
+      overlap_(
+        p.before.s,
+        p.before.e,
+        +event.getStartTime(),
+        +event.getEndTime()
+      )
+    );
+
+    if (conflict) {
+      throw new Error(
+        "還原後 " +
+        name +
+        " 會與另一筆值班／請假紀錄衝突，請先協調。"
+      );
+    }
+  }
+}
+
+
+// 確認本次異動目前仍完整存在，未被後續操作改掉。
+function assertAppliedIntact_(st, events) {
+  checkDependents_(
+    st.plans.map(p => p.token),
+    events
+  );
+
+  for (const p of st.plans) {
+    if (
+      !same_(
+        snap_(
+          mainEvent_(p, events)
+        ),
+        p.after
+      )
+    ) {
+      throw new Error(
+        "主事件已被其他操作修改，取消已攔阻。"
+      );
+    }
+
+    for (const addition of p.additions) {
+      const event = addedEvent_(
+        addition,
+        events
+      );
+
+      if (
+        !event ||
+        !same_(
+          snap_(event),
+          addition.want
+        )
+      ) {
+        throw new Error(
+          "衍生事件已遺失或變動，取消已攔阻。"
+        );
+      }
+    }
+  }
+}
+
+
+function preflightUndo_(st, events) {
+  assertAppliedIntact_(
+    st,
+    events
+  );
+
+  checkRestoreConflicts_(
+    st,
+    events
+  );
+}
+
+
+function restoreTransaction_(
+  c,
+  calendar,
+  st,
+  events,
+  confirmed
+) {
+  checkDependents_(
+    st.plans.map(p => p.token),
+    events
+  );
+
+  checkRestoreConflicts_(
+    st,
+    events
+  );
+
+  const errors = [];
+
+  // 雙向換班從後處理的一邊開始復原。
+  for (const p of [...st.plans].reverse()) {
+    if (
+      !p.touched ||
+      p.restored
+    ) {
       continue;
     }
 
-
-    if (
-      desc.includes(
-        "[AUTO_SPLIT_CREATED]"
-      )
-    ) {
-
-      evt.deleteEvent();
-
-    }
-  }
-
-
-  // ==========================================================
-  // 再恢復原事件
-  // ==========================================================
-
-  const remainingEvents =
-    calendar.getEvents(
-      searchStart,
-      searchEnd
-    );
-
-
-  remainingEvents.forEach(
-    evt => {
-
-      const desc =
-        evt.getDescription() ||
-        "";
-
+    try {
+      const main = mainEvent_(
+        p,
+        events
+      );
 
       if (
-        !desc.includes(
-          rowTokenTag
+        !compatible_(
+          snap_(main),
+          p.before,
+          p.after
         )
       ) {
-
-        return;
-      }
-
-
-      const titleMatch =
-        desc.match(
-          /\[ORIG_TITLE_B64:([^\]]*)\]/
-        );
-
-
-      const descMatch =
-        desc.match(
-          /\[ORIG_DESC_B64:([^\]]*)\]/
-        );
-
-
-      const splitMatch =
-        desc.match(
-          /\[SPLIT_ORIG_TIME:(\d+)-(\d+)\]/
-        );
-
-
-      // 還原原始完整時段
-      if (
-        splitMatch
-      ) {
-
-        evt.setTime(
-
-          new Date(
-            parseInt(
-              splitMatch[1],
-              10
-            )
-          ),
-
-          new Date(
-            parseInt(
-              splitMatch[2],
-              10
-            )
-          )
-
+        throw new Error(
+          "主事件出現非本次修改，未覆寫。"
         );
       }
 
-
-      // ======================================================
-      // 新版：精確恢復修改前 title
-      // ======================================================
-
-      if (
-        titleMatch
+      // 先刪衍生事件，再恢復主事件。
+      for (
+        const addition of [...p.additions].reverse()
       ) {
+        if (
+          addition.stage === "NEW" ||
+          addition.stage === "DELETED"
+        ) {
+          continue;
+        }
 
-        evt.setTitle(
-
-          decodeMetaText(
-            titleMatch[1]
-          )
-
+        const event = addedEvent_(
+          addition,
+          events
         );
 
+        if (!event) {
+          if (
+            addition.stage === "CREATING" &&
+            !addition.id &&
+            !confirmed
+          ) {
+            throw new Error(
+              "新增 API 結果不明：未能確認是否曾建立事件，須人工核對。"
+            );
+          }
 
-      } else {
+        } else {
+          if (
+            !same_(
+              snap_(event),
+              addition.want
+            )
+          ) {
+            throw new Error(
+              "衍生事件已被修改，未刪除。"
+            );
+          }
 
-        // 舊 v6 fallback
+          addition.stage = "DELETING";
 
-        const floor =
-          extractFloorSuffix(
-            evt.getTitle()
+          saveState_(
+            c,
+            st
           );
 
+          event.deleteEvent();
 
-        evt.setTitle(
-          `${origWorker}${floor}`
+          // 從同一批清單移除，
+          // 後續不再讀取或修改已刪除物件。
+          events.splice(
+            events.indexOf(event),
+            1
+          );
+        }
+
+        addition.stage = "DELETED";
+
+        saveState_(
+          c,
+          st
         );
-
       }
 
+      putSnapshot_(
+        main,
+        p.before
+      );
 
-      // ======================================================
-      // 新版：精確恢復修改前 description
-      // ======================================================
+      p.restored = true;
 
-      if (
-        descMatch
-      ) {
+      saveState_(
+        c,
+        st
+      );
 
-        evt.setDescription(
-
-          decodeMetaText(
-            descMatch[1]
-          )
-
-        );
-
-
-      } else {
-
-        // 舊 v6 fallback
-
-        evt.setDescription(
-
-          cleanDescription(
-            desc,
-            rowToken
-          )
-
-        );
-
-      }
+    } catch (err) {
+      errors.push(err.message);
     }
+  }
+
+  if (errors.length) {
+    throw new Error(
+      errors.join("；")
+    );
+  }
+}
+
+
+function finishRestore_(c, st) {
+  st.phase = st.purpose === "undo"
+    ? "UNDONE"
+    : "ROLLED_BACK";
+
+  saveState_(
+    c,
+    st
+  );
+
+  cell_(
+    c,
+    CONFIG.EXECUTE_CHECK_COL
+  ).setValue(false);
+
+  cell_(
+    c,
+    CONFIG.APPROVE_CHECK_COL
+  ).setValue(false);
+
+  const priorMail = text_(
+    cell_(
+      c,
+      CONFIG.APPROVE_LOG_COL
+    ).getValue()
+  );
+
+  if (st.phase === "UNDONE") {
+    status_(
+      c,
+      "已還原班表" +
+      (
+        priorMail
+          ? "；曾有通知紀錄，請另行通知相關人員"
+          : ""
+      )
+    );
+
+  } else {
+    status_(
+      c,
+      "執行失敗，已還原原班表；可重新勾 L 重試：" +
+      st.error
+    );
+  }
+}
+
+
+function markRecovery_(c, st, err) {
+  st.phase = "RECOVER";
+
+  st.error = [
+    st.error,
+    err.message
+  ].filter(Boolean).join("；");
+
+  try {
+    saveState_(
+      c,
+      st
+    );
+
+  } catch (saveError) {
+    console.error(saveError);
+  }
+
+  cell_(
+    c,
+    CONFIG.APPROVE_CHECK_COL
+  ).setValue(false);
+
+  status_(
+    c,
+    "需人工確認：日曆異動／還原尚未完成；暫停其他異動。" +
+    st.error
   );
 }
 
 
 // ============================================================
-// 舊 v6 fallback
+// 舊 v6.2 案件安全匯入
+//
+// 必須有完整快照，才允許自動還原。
+// 沒有快照或沒有 UUID，就不猜測。
 // ============================================================
 
-function cleanDescription(
-  desc,
-  rowToken
-) {
+function adoptLegacy_(c, calendar) {
+  const req = readRequest_(
+    c.s,
+    row_(c)
+  );
 
-  if (
-    !desc
-  ) {
+  const originalStart = +parseTime_(
+    req.date,
+    req.start
+  );
 
-    return "";
+  const originalEnd = +parseTime_(
+    req.date,
+    req.end
+  );
+
+  const isSwap = (
+    hasRealTargetPerson(req.target) &&
+    req.swapDate &&
+    req.swapStart &&
+    req.swapEnd
+  );
+
+  const windows = [{
+    s: originalStart,
+    e: originalEnd,
+    person: req.person,
+    token: c.id + "-A"
+  }];
+
+  if (isSwap) {
+    windows.push({
+      s: +parseTime_(
+        req.swapDate,
+        req.swapStart
+      ),
+
+      e: +parseTime_(
+        req.swapDate,
+        req.swapEnd
+      ),
+
+      person: req.target,
+      token: c.id + "-B"
+    });
   }
 
-
-  let res =
-    desc
-
-      .replaceAll(
-        `[ROW_ID:${rowToken}]\n`,
-        ""
-      )
-
-      .replaceAll(
-        `[ROW_ID:${rowToken}]`,
-        ""
-      )
-
-      .replace(
-        /^\[AUTO_SPLIT_CREATED\]\n?/gm,
-        ""
-      )
-
-      .replace(
-        /^\[SPLIT_ORIG_TIME:\d+-\d+\]\n?/gm,
-        ""
-      )
-
-      .replace(
-        /^\[ORIG_TITLE_B64:[^\]]*\]\n?/gm,
-        ""
-      )
-
-      .replace(
-        /^\[ORIG_DESC_B64:[^\]]*\]\n?/gm,
-        ""
-      );
-
-
-  res =
-    res.replace(
-
-      /【(換班|代班|請假)紀錄】[\s\S]*?--------------------\n?/g,
-
-      ""
-
-    ).trim();
-
-
-  return res;
-}
-
-
-// ============================================================
-// 日期＋時間
-// ============================================================
-
-function combineDateTimeByStr(
-  dateVal,
-  timeStr
-) {
-
-  const d =
+  const events = calendar.getEvents(
     new Date(
-      dateVal
+      Math.min(
+        ...windows.map(w => w.s)
+      ) - 86400000
+    ),
+
+    new Date(
+      Math.max(
+        ...windows.map(w => w.e)
+      ) + 86400000
+    )
+  );
+
+  checkDependents_(
+    windows.map(w => w.token),
+    events
+  );
+
+  const plans = windows.map(w => {
+    const group = events.filter(event =>
+      meta_(
+        event.getDescription(),
+        "ROW_ID"
+      ) === w.token
     );
 
-
-  let hours =
-    0;
-
-
-  let minutes =
-    0;
-
-
-  const str =
-    (timeStr || "")
-      .toString()
-      .trim();
-
-
-  const match =
-    str.match(
-      /(\d{1,2}):(\d{2})/
+    const mainEvents = group.filter(event =>
+      !/^\[AUTO_SPLIT_CREATED\]\s*$/m.test(
+        event.getDescription()
+      )
     );
 
-
-  if (
-    match
-  ) {
-
-    hours =
-      parseInt(
-        match[1],
-        10
+    if (mainEvents.length !== 1) {
+      throw new Error(
+        "舊案件主事件不完整，請人工核對，不能自動還原。"
       );
+    }
 
+    const after = snap_(
+      mainEvents[0]
+    );
 
-    minutes =
-      parseInt(
-        match[2],
-        10
-      );
+    const originalTitle = meta_(
+      after.desc,
+      "ORIG_TITLE_B64"
+    );
 
-
-    const isPM =
-      str.includes(
-        "下午"
-      ) ||
-
-      str
-        .toUpperCase()
-        .includes(
-          "PM"
-        );
-
-
-    const isAM =
-      str.includes(
-        "上午"
-      ) ||
-
-      str
-        .toUpperCase()
-        .includes(
-          "AM"
-        );
-
+    const originalDescription = meta_(
+      after.desc,
+      "ORIG_DESC_B64"
+    );
 
     if (
-      isPM
+      originalTitle === null ||
+      originalDescription === null
     ) {
-
-      if (
-        hours < 12
-      ) {
-
-        hours +=
-          12;
-      }
-
-
-    } else if (
-      isAM
-    ) {
-
-      if (
-        hours === 12
-      ) {
-
-        hours =
-          0;
-      }
+      throw new Error(
+        "舊案件缺少完整狀態快照，請人工處理。"
+      );
     }
-  }
 
+    const before = clone_(after);
 
-  d.setHours(
-    hours,
-    minutes,
-    0,
-    0
+    before.title = dec_(
+      originalTitle
+    );
+
+    before.desc = dec_(
+      originalDescription
+    );
+
+    const split = meta_(
+      after.desc,
+      "SPLIT_ORIG_TIME"
+    );
+
+    if (split) {
+      const parts = split
+        .split("-")
+        .map(Number);
+
+      before.s = parts[0];
+      before.e = parts[1];
+    }
+
+    if (
+      titleInfo_(before.title).name !== w.person ||
+      w.s < before.s ||
+      w.e > before.e
+    ) {
+      throw new Error(
+        "舊申請資料與日曆快照不一致。"
+      );
+    }
+
+    const expected =
+      Number(w.s > before.s) +
+      Number(w.e < before.e);
+
+    if (
+      group.length !== 1 + expected
+    ) {
+      throw new Error(
+        "舊案件衍生事件數量不符，已停止。"
+      );
+    }
+
+    const additions = group
+      .filter(event => event !== mainEvents[0])
+      .map((event, index) => ({
+        key: w.token + ":legacy:" + index,
+        id: event.getId(),
+        stage: "CREATED",
+        want: snap_(event)
+      }));
+
+    return {
+      token: w.token,
+      before: before,
+      after: after,
+      additions: additions,
+      touched: true,
+      restored: false
+    };
+  });
+
+  const st = {
+    kind: "shift-tx",
+    version: CONFIG.VERSION,
+
+    id: c.id,
+    tx: "legacy-" + c.id,
+
+    phase: ACTIVE_PHASE,
+    calendar: calendar.getId(),
+
+    req: req,
+    requestHash: hash_(req),
+
+    type: isSwap
+      ? "swap"
+      : hasRealTargetPerson(req.target)
+        ? "sub"
+        : "leave",
+
+    late: text_(
+      cell_(
+        c,
+        CONFIG.STATUS_COL
+      ).getValue()
+    ).includes("後補代班"),
+
+    plans: plans,
+    purpose: "undo",
+    error: ""
+  };
+
+  saveState_(
+    c,
+    st
   );
 
-
-  return d;
+  return st;
 }
 
 
 // ============================================================
-// 取得申請人 Email
+// Email 設定與收件人檢查
 // ============================================================
 
-function getApplicantEmail(
-  sheet,
-  row
-) {
+function validEmail_(email) {
+  return /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/
+    .test(text_(email));
+}
 
-  const email =
-    sheet.getRange(
-      row,
-      CONFIG.APPLICANT_EMAIL_COL
-    )
-      .getValue()
-      .toString()
-      .trim();
 
+function getApplicantEmail(sheet, r) {
+  const col = CONFIG.APPLICANT_EMAIL_COL;
 
   if (
-    !email
+    !Number.isInteger(col) ||
+    col < 1 ||
+    col > sheet.getMaxColumns()
   ) {
-
-    return "";
+    throw new Error(
+      "CONFIG.APPLICANT_EMAIL_COL 未正確設定。"
+    );
   }
 
+  const email = text_(
+    sheet.getRange(
+      r,
+      col
+    ).getValue()
+  );
 
-  const emailPattern =
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!validEmail_(email)) {
+    throw new Error(
+      "K 欄申請人 Email 空白或格式錯誤。"
+    );
+  }
+
+  return email;
+}
 
 
-  if (
-    !emailPattern.test(
-      email
-    )
-  ) {
-
-    console.error(
-
-      `第 ${row} 列 K欄內容並非有效 Email：${email}`
-
+function staffEmail_(sheet, name) {
+  const directory = sheet.getParent()
+    .getSheetByName(
+      CONFIG.STAFF_DIRECTORY_SHEET_NAME
     );
 
-
-    return "";
+  if (
+    !directory ||
+    directory.getLastRow() < 2
+  ) {
+    throw new Error(
+      "員工名冊不存在或沒有資料。"
+    );
   }
 
+  const data = directory.getRange(
+    2,
+    1,
+    directory.getLastRow() - 1,
+    Math.max(
+      CONFIG.STAFF_NAME_COL,
+      CONFIG.STAFF_EMAIL_COL
+    )
+  ).getValues();
+
+  const matches = data.filter(entry =>
+    text_(
+      entry[CONFIG.STAFF_NAME_COL - 1]
+    ) === name
+  );
+
+  if (matches.length !== 1) {
+    throw new Error(
+      "員工名冊姓名「" +
+      name +
+      "」不存在或重複。"
+    );
+  }
+
+  const email = text_(
+    matches[0][
+      CONFIG.STAFF_EMAIL_COL - 1
+    ]
+  );
+
+  if (!validEmail_(email)) {
+    throw new Error(
+      "名冊「" +
+      name +
+      "」Email 格式不正確。"
+    );
+  }
 
   return email;
 }
 
 
 // ============================================================
-// 員工姓名 → Email
+// 通知紀錄
 // ============================================================
 
-function getStaffEmailByName(
-  name
-) {
+function noticeStore_(c, col) {
+  const store = readNote_(
+    cell_(c, col),
+    "shift-mail"
+  ) || {
+    kind: "shift-mail",
+    id: c.id,
+    batches: {},
+    latest: ""
+  };
 
-  if (
-    !name
-  ) {
-
-    return "";
-  }
-
-
-  const ss =
-    SpreadsheetApp
-      .getActiveSpreadsheet();
-
-
-  const dirSheet =
-    ss.getSheetByName(
-      CONFIG.STAFF_DIRECTORY_SHEET_NAME
+  if (store.id !== c.id) {
+    throw new Error(
+      "通知註解屬於另一筆申請，已停止。"
     );
-
-
-  if (
-    !dirSheet
-  ) {
-
-    console.error(
-
-      `找不到員工名冊分頁「${CONFIG.STAFF_DIRECTORY_SHEET_NAME}」，請確認分頁名稱是否一致`
-
-    );
-
-
-    return "";
   }
 
-
-  const lastRow =
-    dirSheet.getLastRow();
-
-
-  if (
-    lastRow < 2
-  ) {
-
-    return "";
-  }
-
-
-  const numCols =
-    Math.max(
-      CONFIG.STAFF_NAME_COL,
-      CONFIG.STAFF_EMAIL_COL
-    );
-
-
-  const data =
-    dirSheet.getRange(
-
-      2,
-      1,
-
-      lastRow - 1,
-
-      numCols
-
-    ).getValues();
-
-
-  const target =
-    name
-      .toString()
-      .trim();
-
-
-  for (
-    let i = 0;
-    i < data.length;
-    i++
-  ) {
-
-    const rowName =
-      (
-        data[i][
-          CONFIG.STAFF_NAME_COL -
-          1
-        ] ||
-        ""
-      )
-        .toString()
-        .trim();
-
-
-    if (
-      rowName ===
-      target
-    ) {
-
-      return (
-
-        data[i][
-          CONFIG.STAFF_EMAIL_COL -
-          1
-        ] ||
-
-        ""
-
-      )
-        .toString()
-        .trim();
-    }
-  }
-
-
-  console.error(
-
-    `員工名冊中找不到姓名「${target}」對應的 Email`
-
-  );
-
-
-  return "";
+  return store;
 }
 
 
-// ============================================================
-// 退件
-// ============================================================
+function saveMail_(c, col, store) {
+  if (store.id !== c.id) {
+    throw new Error(
+      "通知紀錄與申請 ID 不一致。"
+    );
+  }
 
-function denyRow(
-
-  sheet,
-  row,
-
-  checkCell,
-  statusCell,
-
-  message
-
-) {
-
-  statusCell.setValue(
-    message
-  );
-
-
-  checkCell.setValue(
-    false
-  );
-
-
-  notifyRejectionIfNeeded(
-    sheet,
-    row,
-    message
+  writeNote_(
+    cell_(c, col),
+    store
   );
 }
 
 
-// ============================================================
-// 退件 Email
-// ============================================================
-
-function notifyRejectionIfNeeded(
-  sheet,
-  row,
-  message
+function task_(
+  role,
+  name,
+  subject,
+  body
 ) {
+  return {
+    role: role,
+    name: name,
+    subject: subject,
+    body: body,
 
-  const logCell =
-    sheet.getRange(
-      row,
-      CONFIG.REJECT_LOG_COL
-    );
-
-
-  const prevLog =
-    logCell
-      .getValue()
-      .toString();
-
-
-  if (
-    prevLog ===
-    message
-  ) {
-
-    return;
-  }
-
-
-  try {
-
-    const email =
-      getApplicantEmail(
-        sheet,
-        row
-      );
-
-
-    if (
-      !email
-    ) {
-
-      logCell.setValue(
-
-        message +
-        "（找不到有效 Email，未寄信）"
-
-      );
-
-
-      return;
-    }
-
-
-    const origPerson =
-      sheet.getRange(row, 2)
-        .getValue()
-        .toString()
-        .trim();
-
-
-    const adminBcc =
-      (
-        CONFIG.ADMIN_EMAILS &&
-
-        CONFIG.ADMIN_EMAILS.length >
-        0
-      )
-
-        ? CONFIG.ADMIN_EMAILS.join(
-            ","
-          )
-
-        : undefined;
-
-
-    MailApp.sendEmail({
-
-      to:
-        email,
-
-      bcc:
-        adminBcc,
-
-      subject:
-        "您的換班／代班／請假申請未通過（系統自動退件）",
-
-      body:
-
-`${origPerson} 您好，
-
-您所提出的值班異動申請經系統檢核後無法通過，原因如下：
-${message}
-
-請重新確認排班內容後再次提出申請，如有疑問請洽管理員。
-
-（此為系統自動發送信件，請勿直接回覆）`
-
-    });
-
-
-    logCell.setValue(
-      message
-    );
-
-
-  } catch (
-    err
-  ) {
-
-    logCell.setValue(
-
-      "退件通知寄送失敗: " +
-      err.message
-
-    );
-  }
+    status: "READY",
+    email: "",
+    at: "",
+    error: ""
+  };
 }
 
 
 // ============================================================
-// N 欄批次處理
+// 核准通知
 // ============================================================
 
-function handleApprovalEditRange(
-  sheet,
-  range
-) {
+function approval_(c, deadline) {
+  assertNoPending_(
+    c.s,
+    ""
+  );
 
-  const startRow =
-    Math.max(
-      2,
-      range.getRow()
-    );
+  const st = state_(c);
 
-
-  const endRow =
-    range.getLastRow();
-
-
-  if (
-    startRow >
-    endRow
-  ) {
-
-    return;
-  }
-
-
-  const lock =
-    LockService
-      .getScriptLock();
-
-
-  if (
-    !lock.tryLock(
-      15000
-    )
-  ) {
-
-    return;
-  }
-
-
-  try {
-
-    for (
-      let r = startRow;
-      r <= endRow;
-      r++
-    ) {
-
-      try {
-
-        handleApprovalEdit(
-          sheet,
-          r
-        );
-
-
-      } catch (
-        err
-      ) {
-
-        console.error(
-
-          `第 ${r} 列審核通知處理失敗: ${err.message}`
-
-        );
-
-
-        sheet.getRange(
-          r,
-          CONFIG.APPROVE_LOG_COL
-        ).setValue(
-
-          "處理失敗: " +
-          err.message
-
-        );
-      }
-    }
-
-
-  } finally {
-
-    lock.releaseLock();
-
-  }
-}
-
-
-// ============================================================
-// N 欄 → 核准通知
-// ============================================================
-
-function handleApprovalEdit(
-  sheet,
-  row
-) {
-
-  const approveCheck =
-    sheet.getRange(
-      row,
-      CONFIG.APPROVE_CHECK_COL
-    );
-
-
-  const approveLog =
-    sheet.getRange(
-      row,
-      CONFIG.APPROVE_LOG_COL
-    );
-
-
-  const statusVal =
-    sheet.getRange(
-      row,
+  const currentStatus = text_(
+    cell_(
+      c,
       CONFIG.STATUS_COL
-    )
-      .getValue()
-      .toString();
-
-
-  const isChecked =
-    approveCheck.getValue() ===
-    true;
-
+    ).getValue()
+  );
 
   if (
-    !isChecked
+    (
+      !st &&
+      !currentStatus.startsWith("已更新日曆")
+    ) ||
+    (
+      st &&
+      st.phase !== ACTIVE_PHASE
+    ) ||
+    cell_(
+      c,
+      CONFIG.EXECUTE_CHECK_COL
+    ).getValue() !== true
   ) {
-
-    return;
-  }
-
-
-  const prevLog =
-    approveLog
-      .getValue()
-      .toString();
-
-
-  if (
-    prevLog.startsWith(
-      "已寄送核准通知"
-    )
-  ) {
-
-    return;
-  }
-
-
-  if (
-    !statusVal.startsWith(
-      "已更新日曆"
-    )
-  ) {
-
-    approveCheck.setValue(
-      false
-    );
-
-
-    approveLog.setValue(
-
-      "尚未成功執行班表異動（請先勾選L欄，並確認M欄狀態已顯示「已更新日曆」），無法寄送核准通知"
-
-    );
-
-
-    return;
-  }
-
-
-  try {
-
-    sendApprovalEmail(
-      sheet,
-      row
-    );
-
-
-    approveLog.setValue(
-
-      `已寄送核准通知 ${
-        Utilities.formatDate(
-          new Date(),
-          Session.getScriptTimeZone(),
-          "yyyy/MM/dd HH:mm"
-        )
-      }`
-
-    );
-
-
-  } catch (
-    err
-  ) {
-
-    approveCheck.setValue(
-      false
-    );
-
-
-    approveLog.setValue(
-
-      "寄信失敗: " +
-      err.message
-
-    );
-  }
-}
-
-
-// ============================================================
-// 寄送核准信
-// ============================================================
-
-function sendApprovalEmail(
-  sheet,
-  row
-) {
-
-  const email =
-    getApplicantEmail(
-      sheet,
-      row
-    );
-
-
-  if (
-    !email
-  ) {
+    cell_(
+      c,
+      CONFIG.APPROVE_CHECK_COL
+    ).setValue(false);
 
     throw new Error(
-      "找不到有效的申請人 Email"
+      "班表尚未成功異動或已取消，不能寄核准信。"
     );
   }
 
-
-  const origPerson =
-    sheet.getRange(row, 2)
-      .getValue()
-      .toString()
-      .trim();
-
-
-  const origDate =
-    sheet.getRange(row, 3)
-      .getValue();
-
-
-  const origStartStr =
-    sheet.getRange(row, 4)
-      .getDisplayValue()
-      .toString()
-      .trim();
-
-
-  const origEndStr =
-    sheet.getRange(row, 5)
-      .getDisplayValue()
-      .toString()
-      .trim();
-
-
-  const targetPerson =
-    sheet.getRange(row, 6)
-      .getValue()
-      .toString()
-      .trim();
-
-
-  const swapDate =
-    sheet.getRange(row, 7)
-      .getValue();
-
-
-  const swapStartStr =
-    sheet.getRange(row, 8)
-      .getDisplayValue()
-      .toString()
-      .trim();
-
-
-  const swapEndStr =
-    sheet.getRange(row, 9)
-      .getDisplayValue()
-      .toString()
-      .trim();
-
-
-  const statusVal =
-    sheet.getRange(
-      row,
-      CONFIG.STATUS_COL
-    )
-      .getValue()
-      .toString();
-
-
-  const dateStr =
-    formatDateValue(
-      origDate
-    );
-
-
-  const adminBcc =
-    (
-      CONFIG.ADMIN_EMAILS &&
-
-      CONFIG.ADMIN_EMAILS.length >
-      0
-    )
-
-      ? CONFIG.ADMIN_EMAILS.join(
-          ","
-        )
-
-      : undefined;
-
-
-  const hasTarget =
-    hasRealTargetPerson(
-      targetPerson
-    );
-
-
-  const isSwap =
-    Boolean(
-
-      hasTarget &&
-
-      swapDate &&
-      swapStartStr &&
-      swapEndStr
-
-    );
-
-
-  const isSub =
-    Boolean(
-
-      hasTarget &&
-      !isSwap
-
-    );
-
-
-  const isLaterSubstitute =
-    statusVal.includes(
-      "後補代班"
-    );
-
-
-  let applicantSubject =
-    "【值班申請】已審核通過";
-
-
-  let applicantDetail =
-    "";
-
-
-  if (
-    isSwap
-  ) {
-
-    applicantSubject =
-      "【值班換班申請】已審核通過";
-
-
-    applicantDetail =
-      `（換班對象：${targetPerson}）`;
-
-
-  } else if (
-    isSub
-  ) {
-
-    applicantSubject =
-      isLaterSubstitute
-
-        ? "【值班後補代班】已審核通過"
-
-        : "【值班代班申請】已審核通過";
-
-
-    applicantDetail =
-      `（代班人：${targetPerson}）`;
-
-
-  } else {
-
-    applicantSubject =
-      "【值班請假申請】已審核通過";
-
-
-    applicantDetail =
-      "";
-  }
-
-
-  // ==========================================================
-  // 申請人
-  // ==========================================================
-
-  MailApp.sendEmail({
-
-    to:
-      email,
-
-    bcc:
-      adminBcc,
-
-    subject:
-      applicantSubject,
-
-    body:
-
-`${origPerson} 您好，
-
-您於 ${dateStr} ${origStartStr}-${origEndStr} 提出的值班申請${applicantDetail}已審核通過，並已完成排班異動，新的值班安排已同步至值班日曆。
-
-請留意您的值班安排，如有任何問題歡迎與管理員聯繫。
-
-（此為系統自動發送信件，請勿直接回覆）`
-
-  });
-
-
-  // ==========================================================
-  // 雙向換班 → 通知配合人
-  // ==========================================================
-
-  if (
-    isSwap
-  ) {
-
-    const targetEmail =
-      getStaffEmailByName(
-        targetPerson
+  const req = st
+    ? st.req
+    : readRequest_(
+        c.s,
+        row_(c)
       );
 
+  if (
+    st &&
+    hash_(
+      readRequest_(
+        c.s,
+        row_(c)
+      )
+    ) !== st.requestHash
+  ) {
+    cell_(
+      c,
+      CONFIG.APPROVE_CHECK_COL
+    ).setValue(false);
 
-    if (
-      targetEmail
-    ) {
+    throw new Error(
+      "審核後申請內容已被修改，不能寄送與日曆不一致的通知。"
+    );
+  }
 
-      const swapDateStr =
-        formatDateValue(
-          swapDate
+  // 防止後續班表已經改動，卻補寄過期核准內容。
+  if (st) {
+    try {
+      assertAppliedIntact_(
+        st,
+        eventsForTx_(
+          getCalendar_(),
+          st
+        )
+      );
+
+    } catch (err) {
+      cell_(
+        c,
+        CONFIG.APPROVE_CHECK_COL
+      ).setValue(false);
+
+      throw new Error(
+        "班表已有後續變動，不寄出過期核准通知：" +
+        err.message
+      );
+    }
+  }
+
+  const col = CONFIG.APPROVE_LOG_COL;
+
+  const store = noticeStore_(
+    c,
+    col
+  );
+
+  const key = st
+    ? st.tx
+    : "legacy-" + c.id;
+
+  const legacyText = text_(
+    cell_(c, col).getValue()
+  );
+
+  // 舊版已有完整成功紀錄：不再重寄。
+  if (
+    !st &&
+    !store.latest &&
+    legacyText.startsWith("已寄送核准通知")
+  ) {
+    return;
+  }
+
+  if (!store.batches[key]) {
+    const isSwap = st
+      ? st.type === "swap"
+      : (
+          hasRealTargetPerson(req.target) &&
+          !!req.swapDate
         );
 
+    const isSub = (
+      hasRealTargetPerson(req.target) &&
+      !isSwap
+    );
 
-      MailApp.sendEmail({
+    const label = isSwap
+      ? "換班"
+      : isSub
+        ? (
+            st && st.late
+              ? "後補代班"
+              : "代班"
+          )
+        : "請假";
 
-        to:
-          targetEmail,
+    const original =
+      `${req.date} ${req.start}–${req.end}`;
 
-        bcc:
-          adminBcc,
+    const applicantBody =
+      `${req.person} 您好，\n\n` +
+      `原值班時段：${original}\n` +
+      (
+        isSwap
+          ? (
+              `您改至：${req.swapDate} ` +
+              `${req.swapStart}–${req.swapEnd}\n` +
+              `配合人員：${req.target}\n`
+            )
+          : isSub
+            ? `代班人員：${req.target}\n`
+            : "此時段已核准請假，尚無代班人員。\n"
+      ) +
+      "\n班表已更新，請以最新值班日曆為準。";
 
-        subject:
-          "【值班換班申請】您的班表已完成互換",
+    const tasks = [
+      task_(
+        "applicant",
+        req.person,
+        `【值班${label}申請】已審核通過`,
+        applicantBody
+      )
+    ];
 
-        body:
+    if (isSwap || isSub) {
+      const targetBody =
+        `${req.target} 您好，\n\n` +
+        `您配合 ${req.person} 的申請已通過。\n` +
+        (
+          isSwap
+            ? (
+                `原定時段：${req.swapDate} ` +
+                `${req.swapStart}–${req.swapEnd}\n`
+              )
+            : ""
+        ) +
+        `實際到勤時段：${original}\n\n` +
+        "班表已更新，請留意準時到勤。";
 
-`${targetPerson} 您好，
+      tasks.push(
+        task_(
+          "target",
+          req.target,
+          isSwap
+            ? "【值班換班通知】班表已完成互換"
+            : "【值班代班通知】代班已審核通過",
+          targetBody
+        )
+      );
+    }
 
-您與 ${origPerson} 的換班申請已審核通過：
-- 原定班表：${swapDateStr} ${swapStartStr}-${swapEndStr}
-- 互換至：${dateStr} ${origStartStr}-${origEndStr}
+    // 舊版只記「失敗」時，可能第一封其實已寄出。
+    // 不猜測哪位收件人收到，先要求人工核對。
+    if (
+      !st &&
+      /失敗/.test(legacyText)
+    ) {
+      tasks.forEach(task => {
+        task.status = "UNKNOWN";
 
-新的值班安排已同步至值班日曆，請留意您的值班時間。如有任何問題歡迎與管理員聯繫。
-
-（此為系統自動發送信件，請勿直接回覆）`
-
+        task.error =
+          "舊版紀錄無法確認此收件人是否已寄。";
       });
     }
 
+    store.batches[key] = {
+      label: "核准通知",
+      tasks: tasks
+    };
 
-  } else if (
-    isSub
+    store.latest = key;
+
+    saveMail_(
+      c,
+      col,
+      store
+    );
+  }
+
+  sendBatch_(
+    c,
+    col,
+    store,
+    key,
+    deadline
+  );
+}
+
+
+// ============================================================
+// 系統檢核退件
+// ============================================================
+
+function reject_(c, analysis, stage) {
+  cell_(
+    c,
+    CONFIG.EXECUTE_CHECK_COL
+  ).setValue(false);
+
+  cell_(
+    c,
+    CONFIG.APPROVE_CHECK_COL
+  ).setValue(false);
+
+  status_(
+    c,
+    stage +
+    "未通過：" +
+    analysis.message
+  );
+
+  const col = CONFIG.REJECT_LOG_COL;
+
+  const store = noticeStore_(
+    c,
+    col
+  );
+
+  // 不把預檢／正式審核前綴放進識別碼。
+  // 同一筆資料、同一理由不會只因階段不同而重寄。
+  const key = hash_([
+    analysis.req,
+    analysis.code,
+    analysis.message
+  ]);
+
+  if (!store.batches[key]) {
+    store.batches[key] = {
+      label: analysis.message,
+
+      requestHash: hash_(
+        analysis.req
+      ),
+
+      tasks: [
+        task_(
+          "applicant",
+          analysis.req.person,
+          "【值班異動申請】系統檢核未通過",
+
+          `${analysis.req.person} 您好，\n\n` +
+          `原值班：${analysis.req.date} ` +
+          `${analysis.req.start}–${analysis.req.end}\n` +
+          `申請未通過，原因：\n${analysis.message}\n\n` +
+          "請確認資料後重新提出申請，或洽管理員。"
+        )
+      ]
+    };
+  }
+
+  store.latest = key;
+
+  saveMail_(
+    c,
+    col,
+    store
+  );
+
+  sendBatch_(
+    c,
+    col,
+    store,
+    key,
+    Date.now() + 60000
+  );
+}
+
+
+// ============================================================
+// 逐封寄送
+//
+// READY：尚未寄
+// SENDING：開始交寄，但未寫入完成紀錄
+// SENT：API 回傳成功並完成紀錄
+// FAILED：明確未完成，可以重試
+// UNKNOWN：結果不明，必須先人工核對
+// ============================================================
+
+function sendBatch_(
+  c,
+  col,
+  store,
+  key,
+  deadline
+) {
+  const batch = store.batches[key];
+
+  for (
+    let index = 0;
+    index < batch.tasks.length;
+    index++
   ) {
+    const task = batch.tasks[index];
 
-    // ========================================================
-    // 單向代班／後補代班 → 通知代班人
-    // ========================================================
+    if (task.status === "SENT") continue;
 
-    const targetEmail =
-      getStaffEmailByName(
-        targetPerson
+    // 上次可能在寄出後中斷，不能直接重寄。
+    if (task.status === "SENDING") {
+      task.status = "UNKNOWN";
+
+      task.error =
+        "上次交寄未留下完成紀錄，請先人工核對。";
+
+      saveMail_(
+        c,
+        col,
+        store
       );
+    }
 
+    if (task.status === "UNKNOWN") continue;
 
     if (
-      targetEmail
+      Date.now() > deadline - 10000
     ) {
+      break;
+    }
 
-      MailApp.sendEmail({
+    try {
+      task.email = task.role === "applicant"
+        ? getApplicantEmail(
+            c.s,
+            row_(c)
+          )
+        : staffEmail_(
+            c.s,
+            task.name
+          );
 
-        to:
-          targetEmail,
+      const admins = [
+        ...new Set(CONFIG.ADMIN_EMAILS)
+      ].filter(email =>
+        email.toLowerCase() !==
+        task.email.toLowerCase()
+      );
 
-        bcc:
-          adminBcc,
+      if (
+        MailApp.getRemainingDailyQuota() <
+        1 + admins.length
+      ) {
+        throw new Error(
+          "本日寄信額度不足，尚未寄出。"
+        );
+      }
 
-        subject:
+      task.status = "SENDING";
+      task.error = "";
 
-          isLaterSubstitute
+      // 先保存交寄中狀態，再呼叫 MailApp。
+      saveMail_(
+        c,
+        col,
+        store
+      );
 
-            ? "【值班後補代班通知】代班已審核通過並排入班表"
-
-            : "【值班代班通知】代班已審核通過並排入班表",
+      const message = {
+        to: task.email,
+        subject: task.subject,
 
         body:
+          task.body +
+          `\n\n申請 ID：${c.id}` +
+          `\n通知識別：${key}:${index}` +
+          "\n（系統通知，請勿直接回覆）"
+      };
 
-`${targetPerson} 您好，
+      if (admins.length) {
+        message.bcc = admins.join(",");
+      }
 
-您協助 ${origPerson} 代班的申請已審核通過：
-- 代班時段：${dateStr} ${origStartStr}-${origEndStr}
+      try {
+        MailApp.sendEmail(message);
 
-該時段班表已同步至值班日曆，請留意準時到勤。如有任何問題歡迎與管理員聯繫。
+      } catch (err) {
+        // 明確的授權／額度／收件地址拒絕才直接允許重試。
+        // 一般連線錯誤視為結果不明。
+        const definitelyNotSent =
+          /permission|authorization|required permissions|quota|too many times|invalid.*(email|recipient)|無權限|授權|額度/i
+            .test(err.message);
 
-（此為系統自動發送信件，請勿直接回覆）`
+        task.status = definitelyNotSent
+          ? "FAILED"
+          : "UNKNOWN";
 
-      });
+        task.error = err.message;
+
+        saveMail_(
+          c,
+          col,
+          store
+        );
+
+        continue;
+      }
+
+      task.status = "SENT";
+      task.at = now_();
+
+      // 每一封立即記錄，不等另一位收件人寄完。
+      saveMail_(
+        c,
+        col,
+        store
+      );
+
+    } catch (err) {
+      // API 成功但寫入紀錄失敗，也不能當成未寄。
+      if (
+        task.status === "SENDING" ||
+        task.status === "SENT"
+      ) {
+        task.status = "UNKNOWN";
+
+      } else {
+        task.status = "FAILED";
+      }
+
+      task.error = err.message;
+
+      try {
+        saveMail_(
+          c,
+          col,
+          store
+        );
+
+      } catch (saveError) {
+        console.error(saveError);
+      }
     }
   }
+
+  const done = batch.tasks.every(
+    task => task.status === "SENT"
+  );
+
+  const labels = {
+    SENT: "已寄送",
+    READY: "尚未寄",
+    FAILED: "未完成，可重試",
+    SENDING: "寄送結果待核對",
+    UNKNOWN: "結果不明，須人工核對"
+  };
+
+  const heading =
+    col === CONFIG.APPROVE_LOG_COL
+      ? (
+          done
+            ? "已寄送核准通知"
+            : "核准通知尚未全數完成"
+        )
+      : "退件原因：" + batch.label;
+
+  const details = batch.tasks.map(task =>
+    `${task.name}：${labels[task.status]} ` +
+    `${task.at || ""}` +
+    (
+      task.error
+        ? "；" + task.error
+        : ""
+    )
+  ).join("\n");
+
+  cell_(
+    c,
+    col
+  ).setValue(
+    heading + "\n" + details
+  );
+
+  if (col === CONFIG.APPROVE_LOG_COL) {
+    cell_(
+      c,
+      CONFIG.APPROVE_CHECK_COL
+    ).setValue(done);
+  }
+}
+
+
+// ============================================================
+// 人工工具：選取一列後操作，不必修改程式或刪除紀錄
+// ============================================================
+
+function selected_() {
+  const sheet = SpreadsheetApp
+    .getActiveSpreadsheet()
+    .getActiveSheet();
+
+  const r = sheet
+    .getActiveRange()
+    .getRow();
+
+  if (
+    !isResponseSheet_(sheet) ||
+    r < 2
+  ) {
+    throw new Error(
+      "請先在表單回覆分頁選取一筆申請。"
+    );
+  }
+
+  validateConfig_(sheet);
+
+  return context_(
+    sheet,
+    r
+  );
+}
+
+
+// ============================================================
+// 重試尚未完成的通知
+// ============================================================
+
+function retrySelectedNotifications() {
+  locked_(() => {
+    const c = selected_();
+    const st = state_(c);
+
+    if (
+      st &&
+      (
+        OPEN_PHASES.includes(st.phase) ||
+        st.phase === "UNDONE"
+      )
+    ) {
+      throw new Error(
+        "此列異動未完成或已取消，不補寄先前的核准／退件信。"
+      );
+    }
+
+    const isApplied = (
+      st &&
+      st.phase === ACTIVE_PHASE
+    );
+
+    const isLegacyApplied = (
+      !st &&
+      text_(
+        cell_(
+          c,
+          CONFIG.STATUS_COL
+        ).getValue()
+      ).startsWith("已更新日曆")
+    );
+
+    if (
+      isApplied ||
+      isLegacyApplied
+    ) {
+      cell_(
+        c,
+        CONFIG.APPROVE_CHECK_COL
+      ).setValue(true);
+
+      approval_(
+        c,
+        Date.now() + 60000
+      );
+
+    } else {
+      const store = noticeStore_(
+        c,
+        CONFIG.REJECT_LOG_COL
+      );
+
+      if (!store.latest) {
+        throw new Error(
+          "此列沒有可重試的退件通知。"
+        );
+      }
+
+      if (
+        store.batches[
+          store.latest
+        ].requestHash !== hash_(
+          readRequest_(
+            c.s,
+            row_(c)
+          )
+        )
+      ) {
+        throw new Error(
+          "申請內容已變更，請重新檢核，不補寄過期退件理由。"
+        );
+      }
+
+      sendBatch_(
+        c,
+        CONFIG.REJECT_LOG_COL,
+        store,
+        store.latest,
+        Date.now() + 60000
+      );
+    }
+  });
+}
+
+
+// ============================================================
+// 人工核對不明寄信結果
+//
+// 必須先實際確認收件人信箱／管理員副本。
+// 「是」：確認已寄，標記完成
+// 「否」：確認未寄，允許下次重試
+// 「取消」：仍不確定，不改狀態
+// ============================================================
+
+function resolveSelectedMail() {
+  const c = locked_(
+    () => selected_()
+  );
+
+  const ui = SpreadsheetApp.getUi();
+
+  for (
+    const col of [
+      CONFIG.APPROVE_LOG_COL,
+      CONFIG.REJECT_LOG_COL
+    ]
+  ) {
+    const store = locked_(
+      () => noticeStore_(c, col)
+    );
+
+    for (
+      const key of Object.keys(store.batches)
+    ) {
+      const tasks = store.batches[key].tasks;
+
+      for (
+        let index = 0;
+        index < tasks.length;
+        index++
+      ) {
+        if (
+          ![
+            "UNKNOWN",
+            "SENDING"
+          ].includes(
+            tasks[index].status
+          )
+        ) {
+          continue;
+        }
+
+        const task = tasks[index];
+
+        // UI 等候期間不占用 Script Lock。
+        const answer = ui.alert(
+          "先核對信箱／管理員副本",
+
+          `收件人：${task.name} ${task.email}\n` +
+          `主旨：${task.subject}\n` +
+          `通知識別：${key}:${index}\n\n` +
+          "已確認寄出→「是」；" +
+          "已確認未寄出→「否」；" +
+          "不確定→「取消」。",
+
+          ui.ButtonSet.YES_NO_CANCEL
+        );
+
+        if (answer === ui.Button.CANCEL) {
+          return;
+        }
+
+        locked_(() => {
+          const latest = noticeStore_(
+            c,
+            col
+          );
+
+          const current = latest
+            .batches[key]
+            .tasks[index];
+
+          if (
+            ![
+              "UNKNOWN",
+              "SENDING"
+            ].includes(current.status)
+          ) {
+            return;
+          }
+
+          current.status =
+            answer === ui.Button.YES
+              ? "SENT"
+              : "READY";
+
+          current.at =
+            answer === ui.Button.YES
+              ? now_() + "（人工核對）"
+              : "";
+
+          current.error = "";
+
+          saveMail_(
+            c,
+            col,
+            latest
+          );
+        });
+      }
+    }
+  }
+
+  ui.alert(
+    "核對紀錄已保存。請再用「重試此列未完成通知」更新顯示並補寄。"
+  );
+}
+
+
+// ============================================================
+// 復原中斷的日曆異動
+// ============================================================
+
+function recoverSelectedCalendar() {
+  locked_(() => {
+    const c = selected_();
+    const st = state_(c);
+
+    if (
+      !st ||
+      !OPEN_PHASES.includes(st.phase)
+    ) {
+      throw new Error(
+        "此列沒有待復原的中斷異動。"
+      );
+    }
+
+    const calendar = getCalendar_();
+
+    try {
+      restoreTransaction_(
+        c,
+        calendar,
+        st,
+        eventsForTx_(calendar, st),
+        false
+      );
+
+      finishRestore_(
+        c,
+        st
+      );
+
+    } catch (err) {
+      markRecovery_(
+        c,
+        st,
+        err
+      );
+    }
+  });
+}
+
+
+// ============================================================
+// 人工已恢復原班後，驗證快照並解除鎖定
+//
+// 這不是略過檢查。
+// 原班仍不符合快照，就不允許解除。
+// ============================================================
+
+function confirmSelectedRecovery() {
+  const ui = SpreadsheetApp.getUi();
+
+  const answer = ui.alert(
+    "僅限人工核對後",
+
+    "請先到日曆核對：" +
+    "此筆申請新增的事件均已移除，原班已恢復。" +
+    "確定後才繼續；程式還會再次比對快照。",
+
+    ui.ButtonSet.YES_NO
+  );
+
+  if (answer !== ui.Button.YES) return;
+
+  locked_(() => {
+    const c = selected_();
+    const st = state_(c);
+
+    if (
+      !st ||
+      !OPEN_PHASES.includes(st.phase)
+    ) {
+      throw new Error(
+        "沒有需要解除的中斷紀錄。"
+      );
+    }
+
+    const events = eventsForTx_(
+      getCalendar_(),
+      st
+    );
+
+    checkDependents_(
+      st.plans.map(p => p.token),
+      events
+    );
+
+    for (const p of st.plans) {
+      const originalMatches = same_(
+        snap_(
+          mainEvent_(p, events)
+        ),
+        p.before
+      );
+
+      const hasRemainingAdditions =
+        p.additions.some(addition =>
+          addedEvent_(
+            addition,
+            events
+          )
+        );
+
+      if (
+        !originalMatches ||
+        hasRemainingAdditions
+      ) {
+        throw new Error(
+          "目前日曆仍與原班快照不符，不能解除。"
+        );
+      }
+
+      p.restored = true;
+
+      p.additions.forEach(addition => {
+        addition.stage = "DELETED";
+      });
+    }
+
+    finishRestore_(
+      c,
+      st
+    );
+  });
 }
