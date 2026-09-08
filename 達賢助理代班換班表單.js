@@ -1,99 +1,60 @@
 /**
- * 助理代班／換班系統 v6（穩定版）
+ * 助理代班／換班系統 v6.2.1（後補代班版）
  *
- * 欄位架構對照：
- * A–J 欄：原 Google 表單資料
- * A:時間戳記
- * B:申請人
- * C:原班日
- * D:起時
- * E:迄時
- * F:配合人
- * G:換班日
- * H:換班起時
- * I:換班迄時
- * J:備註
+ * A–J：Google 表單資料
+ * K(11)：申請人 Email
+ * L(12)：審核確認／執行班表異動
+ * M(13)：執行狀態
+ * N(14)：審核通知
+ * O(15)：核准通知記錄
+ * P(16)：退件通知記錄
+ * Q(17)：申請 ID（UUID，可隱藏）
  *
- * K 欄 (11)：申請人 Email
- * L 欄 (12)：☑ 審核確認 / 執行換班
- * M 欄 (13)：執行狀態
- * N 欄 (14)：☑ 審核通知
- * O 欄 (15)：核准通知記錄
- * P 欄 (16)：退件通知記錄
- * Q 欄 (17)：申請 ID（系統自動產生 UUID，可隱藏）
+ * 安裝式觸發器共 2 個：
+ * 1. handleSheetEdit      → 來自試算表 → 編輯時
+ * 2. onFormSubmitPrecheck → 來自試算表 → 表單提交時
  *
- * Apps Script 觸發條件共 2 個：
- *
- * 1. handleSheetEdit
- *    事件來源：來自試算表
- *    事件類型：編輯時
- *
- * 2. onFormSubmitPrecheck
- *    事件來源：來自試算表
- *    事件類型：表單提交時
- *
- * 表單提交時：
- * - 只做「唯讀預檢」
- * - 不會修改 Google Calendar
- * - 預檢失敗 → 自動退件
- * - 預檢成功 → M 顯示待管理員審核
- *
- * 管理員勾 L 時：
- * - 重新讀取最新 Google Calendar
- * - 再執行一次同一套 analyzeRequest()
- * - 通過才真正修改 Calendar
+ * v6.2.1 重點：
+ * - 表單送出先唯讀預檢；管理員勾 L 時重新讀最新 Calendar 再正式執行。
+ * - 「請假（暫時找不到代班人員）」等以「請假」開頭的選項，一律視為純請假。
+ * - Calendar 標題統一：姓名(樓層) [代班]／[換班]／[請假]
+ * - 支援「先請假，後來找到代班人」：再次送一筆單向代班申請即可。
+ * - 後補代班若取消 L，會精確恢復成原本的 [請假] 狀態，而不是正常班。
+ * - 使用 UUID 作為 Calendar 事件控制識別碼，避免列排序／插刪造成串資料。
  */
 
 const MAX_ROWS_PER_RUN = 30;
 const TIME_BUDGET_MS = 5 * 60 * 1000;
 
-
-// ============================================================
-// CONFIG
-// ============================================================
-
 const CONFIG = {
-
   EXECUTE_CHECK_COL: 12, // L
   STATUS_COL: 13,        // M
-
   APPROVE_CHECK_COL: 14, // N
   APPROVE_LOG_COL: 15,   // O
   REJECT_LOG_COL: 16,    // P
-
   REQUEST_ID_COL: 17,    // Q
-
-  APPLICANT_EMAIL_COL: 11, // K
-
-  ADMIN_EMAILS: [
-    "dhl.nccu@gmail.com"
-  ],
-
+  APPLICANT_EMAIL_COL: 11,
+  ADMIN_EMAILS: ["dhl.nccu@gmail.com"],
   STAFF_DIRECTORY_SHEET_NAME: "員工名冊",
-
   STAFF_NAME_COL: 1,
   STAFF_EMAIL_COL: 2
 };
 
 
 // ============================================================
-// 表單提交 → 自動前置預檢
+// 表單提交 → 前置預檢
 // ============================================================
 
 function onFormSubmitPrecheck(e) {
 
   if (!e || !e.range) {
-
     console.error(
       "onFormSubmitPrecheck: 找不到 e.range，請確認觸發器為『來自試算表 / 表單提交時』"
     );
-
     return;
   }
 
-
   const sheet = e.range.getSheet();
-
   const row = e.range.getRow();
 
   const statusCell =
@@ -108,17 +69,13 @@ function onFormSubmitPrecheck(e) {
       CONFIG.EXECUTE_CHECK_COL
     );
 
-
-  // 每一筆申請建立穩定 UUID
   ensureRequestId(
     sheet,
     row
   );
 
-
   const lock =
     LockService.getScriptLock();
-
 
   if (!lock.tryLock(15000)) {
 
@@ -129,14 +86,12 @@ function onFormSubmitPrecheck(e) {
     return;
   }
 
-
   try {
 
     const calendars =
       CalendarApp.getCalendarsByName(
         "達賢館創新組助理值班"
       );
-
 
     if (calendars.length === 0) {
 
@@ -147,14 +102,12 @@ function onFormSubmitPrecheck(e) {
       return;
     }
 
-
     const result =
       analyzeRequest(
         sheet,
         calendars[0],
         row
       );
-
 
     if (result.ok) {
 
@@ -167,18 +120,14 @@ function onFormSubmitPrecheck(e) {
       return;
     }
 
-
     checkCell.setValue(false);
-
 
     const message =
       `預檢未通過：${result.message}`;
 
-
     statusCell.setValue(
       message
     );
-
 
     notifyRejectionIfNeeded(
       sheet,
@@ -186,20 +135,17 @@ function onFormSubmitPrecheck(e) {
       message
     );
 
-
   } catch (err) {
 
     console.error(
       `第 ${row} 列前置預檢失敗: ${err.message}`
     );
 
-
     statusCell.setValue(
       "預檢暫時無法完成：" +
       err.message +
       "（請管理員確認）"
     );
-
 
   } finally {
 
@@ -210,8 +156,36 @@ function onFormSubmitPrecheck(e) {
 
 
 // ============================================================
+// F 欄是否為真正的代班／換班人員
+// ============================================================
+
+function hasRealTargetPerson(value) {
+
+  const v =
+    (value || "")
+      .toString()
+      .trim();
+
+  if (!v) return false;
+
+  if (v === "無") return false;
+
+  // 「請假」
+  // 「請假（暫時找不到代班人員）」
+  // 任何以「請假」開頭的選項，都不是人名
+  if (v.startsWith("請假")) return false;
+
+  return true;
+}
+
+
+// ============================================================
 // 統一分析函式
-// 預檢與正式審核都使用這一套
+// 預檢與正式審核都使用這一套規則
+//
+// 注意：
+// 每次呼叫都重新讀取當下 Calendar，
+// 不會沿用之前預檢的舊結果。
 // ============================================================
 
 function analyzeRequest(
@@ -226,11 +200,9 @@ function analyzeRequest(
       .toString()
       .trim();
 
-
   const origDate =
     sheet.getRange(row, 3)
       .getValue();
-
 
   const origStartStr =
     sheet.getRange(row, 4)
@@ -238,13 +210,11 @@ function analyzeRequest(
       .toString()
       .trim();
 
-
   const origEndStr =
     sheet.getRange(row, 5)
       .getDisplayValue()
       .toString()
       .trim();
-
 
   const targetPerson =
     sheet.getRange(row, 6)
@@ -252,18 +222,15 @@ function analyzeRequest(
       .toString()
       .trim();
 
-
   const swapDate =
     sheet.getRange(row, 7)
       .getValue();
-
 
   const swapStartStr =
     sheet.getRange(row, 8)
       .getDisplayValue()
       .toString()
       .trim();
-
 
   const swapEndStr =
     sheet.getRange(row, 9)
@@ -286,20 +253,25 @@ function analyzeRequest(
     swapDate,
     swapStartStr,
     swapEndStr
+
   };
 
 
-  // -----------------------------
-  // 基本資料檢查
-  // -----------------------------
+  // ==========================================================
+  // 基本資料
+  // ==========================================================
 
   if (!origPerson || !origDate) {
 
     return {
+
       ...base,
+
       ok: false,
+
       message:
         "請填寫原值班人員與原值班日期"
+
     };
   }
 
@@ -307,10 +279,14 @@ function analyzeRequest(
   if (!origStartStr || !origEndStr) {
 
     return {
+
       ...base,
+
       ok: false,
+
       message:
         "請填寫原值班起訖時間"
+
     };
   }
 
@@ -337,17 +313,29 @@ function analyzeRequest(
   ) {
 
     return {
+
       ...base,
+
       ok: false,
+
       message:
         "原值班起訖時間格式不正確"
+
     };
   }
 
 
-  // -----------------------------
+  // ==========================================================
   // 找原班
-  // -----------------------------
+  //
+  // 如果 Calendar 是：
+  // 王小明(4F) [請假]
+  //
+  // extractWorkerName() 仍然會得到：
+  // 王小明
+  //
+  // 所以後續找到代班人時，可以再次申請代班。
+  // ==========================================================
 
   const eventsO =
     getEventsForWindow(
@@ -369,10 +357,14 @@ function analyzeRequest(
   if (events1.length === 0) {
 
     return {
+
       ...base,
+
       ok: false,
+
       message:
         `找不到 ${origPerson} 的原值班行程`
+
     };
   }
 
@@ -380,17 +372,25 @@ function analyzeRequest(
   if (events1.length > 1) {
 
     return {
+
       ...base,
+
       ok: false,
+
       message:
         `${origPerson} 同時段有多筆行程，請聯絡管理員確認`
+
     };
   }
 
 
+  const origEvent =
+    events1[0];
+
+
   const check1 =
     validateTimeRange(
-      events1[0],
+      origEvent,
       origStartTime,
       origEndTime
     );
@@ -399,23 +399,25 @@ function analyzeRequest(
   if (!check1.valid) {
 
     return {
+
       ...base,
+
       ok: false,
+
       message:
         `${origPerson} 的填寫時段超出其原班表 (${check1.actualRange})`
+
     };
   }
 
 
-  // -----------------------------
+  // ==========================================================
   // 判斷申請類型
-  // -----------------------------
+  // ==========================================================
 
   const hasTarget =
-    Boolean(
-      targetPerson &&
-      targetPerson !== "請假" &&
-      targetPerson !== "無"
+    hasRealTargetPerson(
+      targetPerson
     );
 
 
@@ -435,7 +437,7 @@ function analyzeRequest(
     );
 
 
-  // 有配合人，但換班資料只填一部分
+  // 有人名，但 G/H/I 只填一部分
   if (
     hasTarget &&
     hasAnySwapField &&
@@ -443,10 +445,33 @@ function analyzeRequest(
   ) {
 
     return {
+
       ...base,
+
       ok: false,
+
       message:
         "配合換班日期與起訖時間填寫不完整；若為單純代班，請將配合換班日期與時間全部留白"
+
+    };
+  }
+
+
+  // 請假時不應有 G/H/I
+  if (
+    !hasTarget &&
+    hasAnySwapField
+  ) {
+
+    return {
+
+      ...base,
+
+      ok: false,
+
+      message:
+        "請假申請不需填寫配合換班日期與時間，請將 G/H/I 留白"
+
     };
   }
 
@@ -466,6 +491,13 @@ function analyzeRequest(
             ? "sub"
             : "leave"
         );
+
+
+  // 記錄原 Calendar 事件現在是正常班、請假、代班或換班
+  const origStatus =
+    getEventStatus(
+      origEvent.getTitle()
+    );
 
 
   // ==========================================================
@@ -496,10 +528,14 @@ function analyzeRequest(
     ) {
 
       return {
+
         ...base,
+
         ok: false,
+
         message:
           "配合換班起訖時間格式不正確"
+
       };
     }
 
@@ -521,31 +557,47 @@ function analyzeRequest(
       );
 
 
-    if (events2.length === 0) {
+    if (
+      events2.length === 0
+    ) {
 
       return {
+
         ...base,
+
         ok: false,
+
         message:
           `找不到 ${targetPerson} 的互換時段行程`
+
       };
     }
 
 
-    if (events2.length > 1) {
+    if (
+      events2.length > 1
+    ) {
 
       return {
+
         ...base,
+
         ok: false,
+
         message:
           `${targetPerson} 互換時段有多筆行程，請聯絡管理員確認`
+
       };
     }
+
+
+    const swapEvent =
+      events2[0];
 
 
     const check2 =
       validateTimeRange(
-        events2[0],
+        swapEvent,
         swapStartTime,
         swapEndTime
       );
@@ -554,15 +606,19 @@ function analyzeRequest(
     if (!check2.valid) {
 
       return {
+
         ...base,
+
         ok: false,
+
         message:
           `${targetPerson} 的填寫時段超出其原班表 (${check2.actualRange})`
+
       };
     }
 
 
-    // 配合人 → 原申請人的時段
+    // 配合人要移到申請人的原班
     const conflictForTarget =
       findRealConflicts(
 
@@ -573,10 +629,11 @@ function analyzeRequest(
 
         targetPerson,
 
-        events2[0],
+        swapEvent,
 
         swapStartTime,
         swapEndTime
+
       );
 
 
@@ -589,15 +646,19 @@ function analyzeRequest(
 
 
       return {
+
         ...base,
+
         ok: false,
+
         message:
           `${targetPerson} 在原值班時段已有班 (${evt.getTitle()} ${formatEventTime(evt)})`
+
       };
     }
 
 
-    // 申請人 → 配合人的時段
+    // 申請人要移到配合人的班
     const conflictForOrig =
       findRealConflicts(
 
@@ -608,10 +669,11 @@ function analyzeRequest(
 
         origPerson,
 
-        events1[0],
+        origEvent,
 
         origStartTime,
         origEndTime
+
       );
 
 
@@ -624,10 +686,14 @@ function analyzeRequest(
 
 
       return {
+
         ...base,
+
         ok: false,
+
         message:
           `${origPerson} 在互換時段已有值班 (${evt.getTitle()} ${formatEventTime(evt)})`
+
       };
     }
 
@@ -640,6 +706,8 @@ function analyzeRequest(
 
       type,
 
+      origStatus,
+
       origStartTime,
       origEndTime,
 
@@ -649,17 +717,19 @@ function analyzeRequest(
       eventsO,
       eventsS,
 
-      origEvent:
-        events1[0],
+      origEvent,
+      swapEvent
 
-      swapEvent:
-        events2[0]
     };
   }
 
 
   // ==========================================================
   // 單向代班
+  //
+  // 包括：
+  // 1. 一開始就有代班人
+  // 2. 先請假，之後才找到代班人
   // ==========================================================
 
   if (hasTarget) {
@@ -677,6 +747,7 @@ function analyzeRequest(
         null,
         null,
         null
+
       );
 
 
@@ -689,18 +760,18 @@ function analyzeRequest(
 
 
       return {
+
         ...base,
+
         ok: false,
+
         message:
           `${targetPerson} 在代班時段已有值班 (${evt.getTitle()} ${formatEventTime(evt)})`
+
       };
     }
   }
 
-
-  // ==========================================================
-  // 單向代班或純請假 → OK
-  // ==========================================================
 
   return {
 
@@ -710,27 +781,36 @@ function analyzeRequest(
 
     type,
 
+    origStatus,
+
     origStartTime,
     origEndTime,
 
     eventsO,
 
-    origEvent:
-      events1[0],
+    origEvent,
 
     swapEvent:
       null
+
   };
 }
 
 
 // ============================================================
 // 試算表編輯監聽器
+//
+// 如果 L 與 N 同時被編輯：
+// 一定先處理 L，再處理 N。
 // ============================================================
 
 function handleSheetEdit(e) {
 
-  if (!e || !e.range) {
+  if (
+    !e ||
+    !e.range
+  ) {
+
     return;
   }
 
@@ -755,6 +835,7 @@ function handleSheetEdit(e) {
     !(
       startCol >
         CONFIG.EXECUTE_CHECK_COL ||
+
       endCol <
         CONFIG.EXECUTE_CHECK_COL
     );
@@ -764,6 +845,7 @@ function handleSheetEdit(e) {
     !(
       startCol >
         CONFIG.APPROVE_CHECK_COL ||
+
       endCol <
         CONFIG.APPROVE_CHECK_COL
     );
@@ -782,7 +864,9 @@ function handleSheetEdit(e) {
   // 先處理 L
   // ==========================================================
 
-  if (touchesExecuteCol) {
+  if (
+    touchesExecuteCol
+  ) {
 
     const startRow =
       Math.max(
@@ -795,7 +879,11 @@ function handleSheetEdit(e) {
       range.getLastRow();
 
 
-    if (startRow > endRow) {
+    if (
+      startRow >
+      endRow
+    ) {
+
       return;
     }
 
@@ -826,10 +914,16 @@ function handleSheetEdit(e) {
 
 
       sheet.getRange(
+
         endRow + 1,
+
         CONFIG.STATUS_COL,
-        realEndRow - endRow,
+
+        realEndRow -
+        endRow,
+
         1
+
       ).setValue(
 
         `尚未處理：單次批次上限為 ${MAX_ROWS_PER_RUN} 列，請稍後重新勾選此列（或分批操作）`
@@ -839,18 +933,26 @@ function handleSheetEdit(e) {
 
 
     const lock =
-      LockService.getScriptLock();
+      LockService
+        .getScriptLock();
 
 
     if (
-      !lock.tryLock(15000)
+      !lock.tryLock(
+        15000
+      )
     ) {
 
       sheet.getRange(
 
         startRow,
+
         CONFIG.STATUS_COL,
-        endRow - startRow + 1,
+
+        endRow -
+        startRow +
+        1,
+
         1
 
       ).setValue(
@@ -871,9 +973,10 @@ function handleSheetEdit(e) {
     try {
 
       const calendars =
-        CalendarApp.getCalendarsByName(
-          "達賢館創新組助理值班"
-        );
+        CalendarApp
+          .getCalendarsByName(
+            "達賢館創新組助理值班"
+          );
 
 
       if (
@@ -883,8 +986,13 @@ function handleSheetEdit(e) {
         sheet.getRange(
 
           startRow,
+
           CONFIG.STATUS_COL,
-          endRow - startRow + 1,
+
+          endRow -
+          startRow +
+          1,
+
           1
 
         ).setValue(
@@ -917,8 +1025,13 @@ function handleSheetEdit(e) {
           sheet.getRange(
 
             r,
+
             CONFIG.STATUS_COL,
-            endRow - r + 1,
+
+            endRow -
+            r +
+            1,
+
             1
 
           ).setValue(
@@ -985,14 +1098,21 @@ function handleSheetEdit(e) {
 
     } catch (err) {
 
-      console.error(err);
+      console.error(
+        err
+      );
 
 
       sheet.getRange(
 
         startRow,
+
         CONFIG.STATUS_COL,
-        endRow - startRow + 1,
+
+        endRow -
+        startRow +
+        1,
+
         1
 
       ).setValue(
@@ -1010,7 +1130,9 @@ function handleSheetEdit(e) {
     }
 
 
-    if (truncated) {
+    if (
+      truncated
+    ) {
 
       console.log(
 
@@ -1022,10 +1144,12 @@ function handleSheetEdit(e) {
 
 
   // ==========================================================
-  // L 處理完成後再處理 N
+  // L 完成後再處理 N
   // ==========================================================
 
-  if (touchesApproveCol) {
+  if (
+    touchesApproveCol
+  ) {
 
     handleApprovalEditRange(
       sheet,
@@ -1060,7 +1184,8 @@ function processSingleRow(
 
 
   const isChecked =
-    checkCell.getValue() === true;
+    checkCell.getValue() ===
+    true;
 
 
   const statusVal =
@@ -1072,10 +1197,13 @@ function processSingleRow(
   try {
 
     // ========================================================
-    // L 被取消 → 還原班表
+    // L 被取消
+    // → 還原「這一筆申請」造成的 Calendar 異動
     // ========================================================
 
-    if (!isChecked) {
+    if (
+      !isChecked
+    ) {
 
       if (
         !statusVal.includes(
@@ -1179,28 +1307,27 @@ function processSingleRow(
         origPerson,
 
         tokenA
+
       );
 
 
       const isSwap =
         Boolean(
 
+          hasRealTargetPerson(
+            targetPerson
+          ) &&
+
           swapDate &&
           swapStartStr &&
-          swapEndStr &&
-
-          targetPerson &&
-
-          targetPerson !==
-            "請假" &&
-
-          targetPerson !==
-            "無"
+          swapEndStr
 
         );
 
 
-      if (isSwap) {
+      if (
+        isSwap
+      ) {
 
         const swapStartTime =
           combineDateTimeByStr(
@@ -1226,6 +1353,7 @@ function processSingleRow(
           targetPerson,
 
           tokenB
+
         );
       }
 
@@ -1239,7 +1367,7 @@ function processSingleRow(
     }
 
 
-    // 已執行過，不重跑
+    // 已經執行成功過
     if (
       statusVal.includes(
         "已更新日曆"
@@ -1252,7 +1380,8 @@ function processSingleRow(
 
     // ========================================================
     // 正式審核
-    // 每次都重新讀最新 Calendar
+    //
+    // 每次勾 L 都重新讀最新 Calendar。
     // ========================================================
 
     const analysis =
@@ -1263,12 +1392,16 @@ function processSingleRow(
       );
 
 
-    if (!analysis.ok) {
+    if (
+      !analysis.ok
+    ) {
 
       denyRow(
 
         sheet,
+
         row,
+
         checkCell,
         statusCell,
 
@@ -1302,37 +1435,20 @@ function processSingleRow(
     // ========================================================
 
     if (
-      analysis.type === "swap"
+      analysis.type ===
+      "swap"
     ) {
 
       const origDateStr =
-        analysis.origDate
-        instanceof Date
-          ? Utilities.formatDate(
-
-              analysis.origDate,
-
-              Session.getScriptTimeZone(),
-
-              "yyyy/MM/dd"
-
-            )
-          : analysis.origDate;
+        formatDateValue(
+          analysis.origDate
+        );
 
 
       const swapDateStr =
-        analysis.swapDate
-        instanceof Date
-          ? Utilities.formatDate(
-
-              analysis.swapDate,
-
-              Session.getScriptTimeZone(),
-
-              "yyyy/MM/dd"
-
-            )
-          : analysis.swapDate;
+        formatDateValue(
+          analysis.swapDate
+        );
 
 
       let firstSideApplied =
@@ -1361,6 +1477,7 @@ function processSingleRow(
           "[換班]",
 
           tokenA
+
         );
 
 
@@ -1388,11 +1505,11 @@ function processSingleRow(
           "[換班]",
 
           tokenB
+
         );
 
 
       } catch (swapErr) {
-
 
         if (
           firstSideApplied
@@ -1410,6 +1527,7 @@ function processSingleRow(
               analysis.origPerson,
 
               tokenA
+
             );
 
 
@@ -1448,15 +1566,33 @@ function processSingleRow(
 
     // ========================================================
     // 單向代班
+    //
+    // 如果 origStatus === leave：
+    // 代表原事件已經是：
+    // 王小明(4F) [請假]
+    //
+    // 這次就是「後補代班」。
     // ========================================================
 
     if (
-      analysis.type === "sub"
+      analysis.type ===
+      "sub"
     ) {
+
+      const isLaterSubstitute =
+        analysis.origStatus ===
+        "leave";
 
 
       const desc =
-        `【代班紀錄】
+        isLaterSubstitute
+
+          ? `【代班紀錄】
+- 實際到勤：${analysis.targetPerson}
+- 原定值班：${analysis.origPerson}
+- 原狀態：已請假，後續找到代班人`
+
+          : `【代班紀錄】
 - 實際到勤：${analysis.targetPerson}
 - 原定值班：${analysis.origPerson}（請假由他人代班）`;
 
@@ -1478,11 +1614,18 @@ function processSingleRow(
         "[代班]",
 
         tokenA
+
       );
 
 
       statusCell.setValue(
-        "已更新日曆（代班完成）"
+
+        isLaterSubstitute
+
+          ? "已更新日曆（後補代班完成）"
+
+          : "已更新日曆（代班完成）"
+
       );
 
 
@@ -1513,9 +1656,10 @@ function processSingleRow(
 
       desc,
 
-      "【請假】",
+      "[請假]",
 
       tokenA
+
     );
 
 
@@ -1525,7 +1669,6 @@ function processSingleRow(
 
 
   } catch (err) {
-
 
     const failMsg =
       "執行失敗: " +
@@ -1537,7 +1680,9 @@ function processSingleRow(
     );
 
 
-    if (isChecked) {
+    if (
+      isChecked
+    ) {
 
       checkCell.setValue(
         false
@@ -1545,10 +1690,8 @@ function processSingleRow(
 
 
       notifyRejectionIfNeeded(
-
         sheet,
         row,
-
         failMsg
       );
     }
@@ -1610,7 +1753,8 @@ function matchPersonEvents(
   personName
 ) {
 
-  const matched = [];
+  const matched =
+    [];
 
 
   for (
@@ -1626,7 +1770,8 @@ function matchPersonEvents(
     if (
       extractWorkerName(
         evt.getTitle()
-      ) !== personName
+      ) !==
+      personName
     ) {
 
       continue;
@@ -1642,8 +1787,11 @@ function matchPersonEvents(
 
 
     if (
-      reqStart < evEnd &&
-      evStart < reqEnd
+      reqStart <
+      evEnd &&
+
+      evStart <
+      reqEnd
     ) {
 
       matched.push(
@@ -1677,14 +1825,14 @@ function findRealConflicts(
 
 ) {
 
-
   const cedingId =
     cedingEvent
       ? cedingEvent.getId()
       : null;
 
 
-  const conflicts = [];
+  const conflicts =
+    [];
 
 
   for (
@@ -1693,7 +1841,6 @@ function findRealConflicts(
     i++
   ) {
 
-
     const evt =
       events[i];
 
@@ -1701,7 +1848,8 @@ function findRealConflicts(
     if (
       extractWorkerName(
         evt.getTitle()
-      ) !== personName
+      ) !==
+      personName
     ) {
 
       continue;
@@ -1716,14 +1864,14 @@ function findRealConflicts(
       evt.getEndTime();
 
 
+    // 即將讓出的行程
     if (
       cedingId &&
       evt.getId() ===
-        cedingId
+      cedingId
     ) {
 
-
-      // 讓出時段之前的殘餘
+      // 前半段殘餘
       if (
         evStart.getTime() <
         cededStart.getTime()
@@ -1731,9 +1879,10 @@ function findRealConflicts(
 
         if (
           targetStart <
-            cededStart &&
+          cededStart &&
+
           evStart <
-            targetEnd
+          targetEnd
         ) {
 
           conflicts.push(
@@ -1745,7 +1894,7 @@ function findRealConflicts(
       }
 
 
-      // 讓出時段之後的殘餘
+      // 後半段殘餘
       if (
         cededEnd.getTime() <
         evEnd.getTime()
@@ -1753,9 +1902,10 @@ function findRealConflicts(
 
         if (
           targetStart <
-            evEnd &&
+          evEnd &&
+
           cededEnd <
-            targetEnd
+          targetEnd
         ) {
 
           conflicts.push(
@@ -1770,10 +1920,10 @@ function findRealConflicts(
     } else if (
 
       targetStart <
-        evEnd &&
+      evEnd &&
 
       evStart <
-        targetEnd
+      targetEnd
 
     ) {
 
@@ -1789,7 +1939,7 @@ function findRealConflicts(
 
 
 // ============================================================
-// 從日曆標題取得「真正的姓名」
+// Calendar 標題處理
 // ============================================================
 
 function extractWorkerName(
@@ -1802,24 +1952,17 @@ function extractWorkerName(
       .trim();
 
 
-  // 【請假】王小明(3F)
+  // 王小明(4F) [代班]
+  // 王小明(4F) [換班]
+  // 王小明(4F) [請假]
   name =
     name.replace(
-      /^【請假】\s*/,
+      /\s*\[(換班|代班|請假)\]\s*$/,
       ""
     );
 
 
-  // 王小明(3F) [換班]
-  // 王小明(3F) [代班]
-  name =
-    name.replace(
-      /\s*\[(換班|代班)\]\s*$/,
-      ""
-    );
-
-
-  // 移除最後樓層括號
+  // 移除樓層
   name =
     name.replace(
       /\s*(\([^\)]*\)|（[^）]*）)\s*$/,
@@ -1828,6 +1971,86 @@ function extractWorkerName(
 
 
   return name.trim();
+}
+
+
+function extractFloorSuffix(
+  title
+) {
+
+  const pureTitle =
+    (title || "")
+      .toString()
+      .replace(
+        /\s*\[(換班|代班|請假)\]\s*$/g,
+        ""
+      )
+      .trim();
+
+
+  const match =
+    pureTitle.match(
+      /(\([^\)]+\)|（[^）]+）)$/
+    );
+
+
+  return match
+    ? match[0]
+    : "";
+}
+
+
+function getEventStatus(
+  title
+) {
+
+  const t =
+    (title || "")
+      .toString()
+      .trim();
+
+
+  if (
+    /\[請假\]\s*$/.test(
+      t
+    )
+  ) {
+
+    return "leave";
+  }
+
+
+  if (
+    /\[代班\]\s*$/.test(
+      t
+    )
+  ) {
+
+    return "sub";
+  }
+
+
+  if (
+    /\[換班\]\s*$/.test(
+      t
+    )
+  ) {
+
+    return "swap";
+  }
+
+
+  return "normal";
+}
+
+
+function buildShiftTitle(
+  worker,
+  floor,
+  tag
+) {
+
+  return `${worker}${floor} ${tag}`;
 }
 
 
@@ -1854,7 +2077,8 @@ function isValidTimeRange(
       end.getTime()
     ) &&
 
-    start < end
+    start <
+    end
 
   );
 }
@@ -1882,7 +2106,9 @@ function ensureRequestId(
       .trim();
 
 
-  if (!id) {
+  if (
+    !id
+  ) {
 
     id =
       Utilities.getUuid();
@@ -1921,16 +2147,22 @@ function getRequestTokenBase(
       .trim();
 
 
-  if (existing) {
+  if (
+    existing
+  ) {
 
     return existing;
   }
 
 
-  // 相容以前以列號當 ROW_ID 的舊資料
-  if (legacyForExisting) {
+  // 舊資料相容
+  if (
+    legacyForExisting
+  ) {
 
-    return String(row);
+    return String(
+      row
+    );
   }
 
 
@@ -1981,8 +2213,28 @@ function formatEventTime(
 }
 
 
+function formatDateValue(
+  value
+) {
+
+  return value instanceof Date
+
+    ? Utilities.formatDate(
+
+        value,
+
+        Session.getScriptTimeZone(),
+
+        "yyyy/MM/dd"
+
+      )
+
+    : value;
+}
+
+
 // ============================================================
-// 確認申請時段是否在原班表內
+// 確認申請時段是否在原事件內
 // ============================================================
 
 function validateTimeRange(
@@ -2044,21 +2296,21 @@ function validateTimeRange(
   if (
 
     s <
-      evStart -
-      60000 ||
+    evStart -
+    60000 ||
 
     e >
-      evEnd +
-      60000
+    evEnd +
+    60000
 
   ) {
 
     return {
 
-      valid: false,
+      valid:
+        false,
 
-      actualRange:
-        actualRange
+      actualRange
 
     };
   }
@@ -2066,12 +2318,155 @@ function validateTimeRange(
 
   return {
 
-    valid: true,
+    valid:
+      true,
 
-    actualRange:
-      actualRange
+    actualRange
 
   };
+}
+
+
+// ============================================================
+// 原始狀態封存
+//
+// 這是 v6.2 最重要的新增設計之一。
+// 把修改前完整的 Calendar title / description 封存起來。
+//
+// 因此：
+//
+// 王小明(4F) [請假]
+// ↓ 後補代班
+// 李小華(4F) [代班]
+//
+// 如果取消後補代班：
+//
+// 李小華(4F) [代班]
+// ↓
+// 王小明(4F) [請假]
+//
+// 可以精確恢復。
+// ============================================================
+
+function encodeMetaText(
+  text
+) {
+
+  return Utilities.base64EncodeWebSafe(
+
+    (text || "")
+      .toString(),
+
+    Utilities.Charset.UTF_8
+
+  );
+}
+
+
+function decodeMetaText(
+  encoded
+) {
+
+  if (
+    !encoded
+  ) {
+
+    return "";
+  }
+
+
+  return Utilities.newBlob(
+
+    Utilities.base64DecodeWebSafe(
+      encoded
+    )
+
+  ).getDataAsString(
+    "UTF-8"
+  );
+}
+
+
+// 移除前一層事件的系統控制標記。
+// 真正原始內容會另外完整封存在 ORIG_DESC_B64。
+function stripControlMetadata(
+  desc
+) {
+
+  return (desc || "")
+
+    .toString()
+
+    .replace(
+      /^\[AUTO_SPLIT_CREATED\]\n?/gm,
+      ""
+    )
+
+    .replace(
+      /^\[ROW_ID:[^\]]+\]\n?/gm,
+      ""
+    )
+
+    .replace(
+      /^\[ORIG_TITLE_B64:[^\]]*\]\n?/gm,
+      ""
+    )
+
+    .replace(
+      /^\[ORIG_DESC_B64:[^\]]*\]\n?/gm,
+      ""
+    )
+
+    .replace(
+      /^\[SPLIT_ORIG_TIME:\d+-\d+\]\n?/gm,
+      ""
+    )
+
+    .trim();
+}
+
+
+function buildControlHeader(
+
+  rowToken,
+
+  originalTitle,
+  originalDescription,
+
+  evStart,
+  evEnd,
+
+  includeSplitTime
+
+) {
+
+  const parts =
+    [
+
+      `[ROW_ID:${rowToken}]`,
+
+      `[ORIG_TITLE_B64:${encodeMetaText(originalTitle)}]`,
+
+      `[ORIG_DESC_B64:${encodeMetaText(originalDescription)}]`
+
+    ];
+
+
+  if (
+    includeSplitTime
+  ) {
+
+    parts.push(
+
+      `[SPLIT_ORIG_TIME:${evStart.getTime()}-${evEnd.getTime()}]`
+
+    );
+  }
+
+
+  return parts.join(
+    "\n"
+  );
 }
 
 
@@ -2099,7 +2494,6 @@ function applyShiftChange(
 
 ) {
 
-
   const evStart =
     mainEvent.getStartTime();
 
@@ -2108,14 +2502,37 @@ function applyShiftChange(
     mainEvent.getEndTime();
 
 
+  const originalTitle =
+    mainEvent.getTitle();
+
+
+  const originalDescription =
+    mainEvent.getDescription() ||
+    "";
+
+
+  const inheritedDescription =
+    stripControlMetadata(
+      originalDescription
+    );
+
+
   const floor =
     extractFloorSuffix(
-      mainEvent.getTitle()
+      originalTitle
     );
 
 
   const rowMeta =
     `[ROW_ID:${rowToken}]`;
+
+
+  const newTitle =
+    buildShiftTitle(
+      newWorker,
+      floor,
+      tag
+    );
 
 
   // ==========================================================
@@ -2127,20 +2544,31 @@ function applyShiftChange(
     Math.abs(
       evStart.getTime() -
       subStart.getTime()
-    ) < 60000 &&
+    ) <
+    60000 &&
 
     Math.abs(
       evEnd.getTime() -
       subEnd.getTime()
-    ) < 60000
+    ) <
+    60000
 
   ) {
 
+    const controlHeader =
+      buildControlHeader(
 
-    const newTitle =
-      tag.startsWith("【")
-        ? `${tag}${newWorker}${floor}`
-        : `${newWorker}${floor} ${tag}`;
+        rowToken,
+
+        originalTitle,
+        originalDescription,
+
+        evStart,
+        evEnd,
+
+        false
+
+      );
 
 
     mainEvent.setTitle(
@@ -2150,15 +2578,10 @@ function applyShiftChange(
 
     mainEvent.setDescription(
 
-      `${rowMeta}
+      `${controlHeader}
 ${descText}
 --------------------
-` +
-
-      cleanDescription(
-        mainEvent.getDescription(),
-        rowToken
-      )
+${inheritedDescription}`.trim()
 
     );
 
@@ -2167,8 +2590,20 @@ ${descText}
   }
 
 
-  const backupMeta =
-    `[SPLIT_ORIG_TIME:${evStart.getTime()}-${evEnd.getTime()}]`;
+  const controlHeader =
+    buildControlHeader(
+
+      rowToken,
+
+      originalTitle,
+      originalDescription,
+
+      evStart,
+      evEnd,
+
+      true
+
+    );
 
 
   // ==========================================================
@@ -2178,13 +2613,12 @@ ${descText}
   if (
 
     subStart.getTime() >
-      evStart.getTime() &&
+    evStart.getTime() &&
 
     subEnd.getTime() <
-      evEnd.getTime()
+    evEnd.getTime()
 
   ) {
-
 
     mainEvent.setTime(
       evStart,
@@ -2194,57 +2628,58 @@ ${descText}
 
     mainEvent.setDescription(
 
-      `${rowMeta}
-${backupMeta}
-` +
-
-      (
-        mainEvent.getDescription() ||
-        ""
-      )
+      `${controlHeader}
+${inheritedDescription}`.trim()
 
     );
 
 
-    const midTitle =
-      tag.startsWith("【")
-        ? `${tag}${newWorker}${floor}`
-        : `${newWorker}${floor} ${tag}`;
-
-
     calendar.createEvent(
 
-      midTitle,
+      newTitle,
 
       subStart,
       subEnd,
 
       {
+
         description:
+
 `[AUTO_SPLIT_CREATED]
 ${rowMeta}
 ${descText}
 --------------------
-`
+${inheritedDescription}`.trim()
+
       }
 
     );
 
 
+    // 後半段維持原本狀態。
+    //
+    // 如果原本是：
+    // 王小明(4F) [請假]
+    //
+    // 後半段就仍然是：
+    // 王小明(4F) [請假]
+    //
+    // 不會變回正常班。
     calendar.createEvent(
 
-      `${origWorker}${floor}`,
+      originalTitle,
 
       subEnd,
       evEnd,
 
       {
+
         description:
+
 `[AUTO_SPLIT_CREATED]
 ${rowMeta}
-【原班後半段】
---------------------
-`
+${inheritedDescription}`.trim()
+
       }
 
     );
@@ -2261,15 +2696,15 @@ ${rowMeta}
   if (
 
     subStart.getTime() >
-      evStart.getTime() &&
+    evStart.getTime() &&
 
     Math.abs(
       subEnd.getTime() -
       evEnd.getTime()
-    ) < 60000
+    ) <
+    60000
 
   ) {
-
 
     mainEvent.setTime(
       evStart,
@@ -2279,22 +2714,10 @@ ${rowMeta}
 
     mainEvent.setDescription(
 
-      `${rowMeta}
-${backupMeta}
-` +
-
-      (
-        mainEvent.getDescription() ||
-        ""
-      )
+      `${controlHeader}
+${inheritedDescription}`.trim()
 
     );
-
-
-    const newTitle =
-      tag.startsWith("【")
-        ? `${tag}${newWorker}${floor}`
-        : `${newWorker}${floor} ${tag}`;
 
 
     calendar.createEvent(
@@ -2305,12 +2728,15 @@ ${backupMeta}
       subEnd,
 
       {
+
         description:
+
 `[AUTO_SPLIT_CREATED]
 ${rowMeta}
 ${descText}
 --------------------
-`
+${inheritedDescription}`.trim()
+
       }
 
     );
@@ -2329,13 +2755,13 @@ ${descText}
     Math.abs(
       subStart.getTime() -
       evStart.getTime()
-    ) < 60000 &&
+    ) <
+    60000 &&
 
     subEnd.getTime() <
-      evEnd.getTime()
+    evEnd.getTime()
 
   ) {
-
 
     mainEvent.setTime(
       subEnd,
@@ -2345,22 +2771,10 @@ ${descText}
 
     mainEvent.setDescription(
 
-      `${rowMeta}
-${backupMeta}
-` +
-
-      (
-        mainEvent.getDescription() ||
-        ""
-      )
+      `${controlHeader}
+${inheritedDescription}`.trim()
 
     );
-
-
-    const newTitle =
-      tag.startsWith("【")
-        ? `${tag}${newWorker}${floor}`
-        : `${newWorker}${floor} ${tag}`;
 
 
     calendar.createEvent(
@@ -2371,12 +2785,15 @@ ${backupMeta}
       subEnd,
 
       {
+
         description:
+
 `[AUTO_SPLIT_CREATED]
 ${rowMeta}
 ${descText}
 --------------------
-`
+${inheritedDescription}`.trim()
+
       }
 
     );
@@ -2387,13 +2804,22 @@ ${descText}
 
 
   throw new Error(
+
     "無法計算時段切割，請確認起訖時間是否正確"
+
   );
 }
 
 
 // ============================================================
 // 還原 Calendar
+//
+// 新版優先使用：
+//
+// ORIG_TITLE_B64
+// ORIG_DESC_B64
+//
+// 精確恢復修改前的狀態。
 // ============================================================
 
 function revertEvents(
@@ -2408,7 +2834,6 @@ function revertEvents(
   rowToken
 
 ) {
-
 
   const searchStart =
     new Date(
@@ -2447,9 +2872,60 @@ function revertEvents(
     `[ROW_ID:${rowToken}]`;
 
 
-  events.forEach(
-    evt => {
+  // ==========================================================
+  // 先刪除這次切割產生的新事件
+  // ==========================================================
 
+  for (
+    let i = events.length - 1;
+    i >= 0;
+    i--
+  ) {
+
+    const evt =
+      events[i];
+
+
+    const desc =
+      evt.getDescription() ||
+      "";
+
+
+    if (
+      !desc.includes(
+        rowTokenTag
+      )
+    ) {
+
+      continue;
+    }
+
+
+    if (
+      desc.includes(
+        "[AUTO_SPLIT_CREATED]"
+      )
+    ) {
+
+      evt.deleteEvent();
+
+    }
+  }
+
+
+  // ==========================================================
+  // 再恢復原事件
+  // ==========================================================
+
+  const remainingEvents =
+    calendar.getEvents(
+      searchStart,
+      searchEnd
+    );
+
+
+  remainingEvents.forEach(
+    evt => {
 
       const desc =
         evt.getDescription() ||
@@ -2466,16 +2942,16 @@ function revertEvents(
       }
 
 
-      if (
-        desc.includes(
-          "[AUTO_SPLIT_CREATED]"
-        )
-      ) {
+      const titleMatch =
+        desc.match(
+          /\[ORIG_TITLE_B64:([^\]]*)\]/
+        );
 
-        evt.deleteEvent();
 
-        return;
-      }
+      const descMatch =
+        desc.match(
+          /\[ORIG_DESC_B64:([^\]]*)\]/
+        );
 
 
       const splitMatch =
@@ -2484,66 +2960,55 @@ function revertEvents(
         );
 
 
-      if (splitMatch) {
-
-
-        const origS =
-          new Date(
-            parseInt(
-              splitMatch[1]
-            )
-          );
-
-
-        const origE =
-          new Date(
-            parseInt(
-              splitMatch[2]
-            )
-          );
-
+      // 還原原始完整時段
+      if (
+        splitMatch
+      ) {
 
         evt.setTime(
-          origS,
-          origE
-        );
 
+          new Date(
+            parseInt(
+              splitMatch[1],
+              10
+            )
+          ),
 
-        evt.setDescription(
-
-          desc.replace(
-            /\[SPLIT_ORIG_TIME:\d+-\d+\]\n?/g,
-            ""
+          new Date(
+            parseInt(
+              splitMatch[2],
+              10
+            )
           )
 
         );
       }
 
 
-      const title =
-        evt.getTitle();
-
+      // ======================================================
+      // 新版：精確恢復修改前 title
+      // ======================================================
 
       if (
-
-        title.includes(
-          "[代班]"
-        ) ||
-
-        title.includes(
-          "[換班]"
-        ) ||
-
-        title.includes(
-          "【請假】"
-        )
-
+        titleMatch
       ) {
 
+        evt.setTitle(
+
+          decodeMetaText(
+            titleMatch[1]
+          )
+
+        );
+
+
+      } else {
+
+        // 舊 v6 fallback
 
         const floor =
           extractFloorSuffix(
-            title
+            evt.getTitle()
           );
 
 
@@ -2551,6 +3016,29 @@ function revertEvents(
           `${origWorker}${floor}`
         );
 
+      }
+
+
+      // ======================================================
+      // 新版：精確恢復修改前 description
+      // ======================================================
+
+      if (
+        descMatch
+      ) {
+
+        evt.setDescription(
+
+          decodeMetaText(
+            descMatch[1]
+          )
+
+        );
+
+
+      } else {
+
+        // 舊 v6 fallback
 
         evt.setDescription(
 
@@ -2560,6 +3048,7 @@ function revertEvents(
           )
 
         );
+
       }
     }
   );
@@ -2567,41 +3056,7 @@ function revertEvents(
 
 
 // ============================================================
-// 擷取樓層
-// ============================================================
-
-function extractFloorSuffix(
-  title
-) {
-
-  const pureTitle =
-    title
-
-      .replace(
-        /\s*\[(換班|代班)\]/g,
-        ""
-      )
-
-      .replace(
-        /【請假】/g,
-        ""
-      );
-
-
-  const match =
-    pureTitle.match(
-      /(\([^\)]+\)|（[^）]+）)$/
-    );
-
-
-  return match
-    ? match[0]
-    : "";
-}
-
-
-// ============================================================
-// 清除系統中繼資料
+// 舊 v6 fallback
 // ============================================================
 
 function cleanDescription(
@@ -2609,7 +3064,10 @@ function cleanDescription(
   rowToken
 ) {
 
-  if (!desc) {
+  if (
+    !desc
+  ) {
+
     return "";
   }
 
@@ -2624,6 +3082,26 @@ function cleanDescription(
 
       .replaceAll(
         `[ROW_ID:${rowToken}]`,
+        ""
+      )
+
+      .replace(
+        /^\[AUTO_SPLIT_CREATED\]\n?/gm,
+        ""
+      )
+
+      .replace(
+        /^\[SPLIT_ORIG_TIME:\d+-\d+\]\n?/gm,
+        ""
+      )
+
+      .replace(
+        /^\[ORIG_TITLE_B64:[^\]]*\]\n?/gm,
+        ""
+      )
+
+      .replace(
+        /^\[ORIG_DESC_B64:[^\]]*\]\n?/gm,
         ""
       );
 
@@ -2651,15 +3129,18 @@ function combineDateTimeByStr(
   timeStr
 ) {
 
-
   const d =
     new Date(
       dateVal
     );
 
 
-  let hours = 0;
-  let minutes = 0;
+  let hours =
+    0;
+
+
+  let minutes =
+    0;
 
 
   const str =
@@ -2674,8 +3155,9 @@ function combineDateTimeByStr(
     );
 
 
-  if (match) {
-
+  if (
+    match
+  ) {
 
     hours =
       parseInt(
@@ -2698,7 +3180,9 @@ function combineDateTimeByStr(
 
       str
         .toUpperCase()
-        .includes("PM");
+        .includes(
+          "PM"
+        );
 
 
     const isAM =
@@ -2708,28 +3192,34 @@ function combineDateTimeByStr(
 
       str
         .toUpperCase()
-        .includes("AM");
+        .includes(
+          "AM"
+        );
 
 
-    if (isPM) {
-
+    if (
+      isPM
+    ) {
 
       if (
         hours < 12
       ) {
 
-        hours += 12;
+        hours +=
+          12;
       }
 
 
-    } else if (isAM) {
-
+    } else if (
+      isAM
+    ) {
 
       if (
         hours === 12
       ) {
 
-        hours = 0;
+        hours =
+          0;
       }
     }
   }
@@ -2756,19 +3246,6 @@ function getApplicantEmail(
   row
 ) {
 
-
-  if (
-    !CONFIG.APPLICANT_EMAIL_COL
-  ) {
-
-    console.error(
-      "尚未設定 CONFIG.APPLICANT_EMAIL_COL"
-    );
-
-    return "";
-  }
-
-
   const email =
     sheet.getRange(
       row,
@@ -2779,7 +3256,10 @@ function getApplicantEmail(
       .trim();
 
 
-  if (!email) {
+  if (
+    !email
+  ) {
+
     return "";
   }
 
@@ -2795,8 +3275,11 @@ function getApplicantEmail(
   ) {
 
     console.error(
+
       `第 ${row} 列 K欄內容並非有效 Email：${email}`
+
     );
+
 
     return "";
   }
@@ -2807,15 +3290,17 @@ function getApplicantEmail(
 
 
 // ============================================================
-// 依姓名找員工 Email
+// 員工姓名 → Email
 // ============================================================
 
 function getStaffEmailByName(
   name
 ) {
 
+  if (
+    !name
+  ) {
 
-  if (!name) {
     return "";
   }
 
@@ -2831,11 +3316,16 @@ function getStaffEmailByName(
     );
 
 
-  if (!dirSheet) {
+  if (
+    !dirSheet
+  ) {
 
     console.error(
+
       `找不到員工名冊分頁「${CONFIG.STAFF_DIRECTORY_SHEET_NAME}」，請確認分頁名稱是否一致`
+
     );
+
 
     return "";
   }
@@ -2885,7 +3375,6 @@ function getStaffEmailByName(
     i++
   ) {
 
-
     const rowName =
       (
         data[i][
@@ -2899,7 +3388,8 @@ function getStaffEmailByName(
 
 
     if (
-      rowName === target
+      rowName ===
+      target
     ) {
 
       return (
@@ -2919,7 +3409,9 @@ function getStaffEmailByName(
 
 
   console.error(
+
     `員工名冊中找不到姓名「${target}」對應的 Email`
+
   );
 
 
@@ -2942,7 +3434,6 @@ function denyRow(
   message
 
 ) {
-
 
   statusCell.setValue(
     message
@@ -2972,7 +3463,6 @@ function notifyRejectionIfNeeded(
   message
 ) {
 
-
   const logCell =
     sheet.getRange(
       row,
@@ -2981,12 +3471,14 @@ function notifyRejectionIfNeeded(
 
 
   const prevLog =
-    logCell.getValue()
+    logCell
+      .getValue()
       .toString();
 
 
   if (
-    prevLog === message
+    prevLog ===
+    message
   ) {
 
     return;
@@ -2995,7 +3487,6 @@ function notifyRejectionIfNeeded(
 
   try {
 
-
     const email =
       getApplicantEmail(
         sheet,
@@ -3003,8 +3494,9 @@ function notifyRejectionIfNeeded(
       );
 
 
-    if (!email) {
-
+    if (
+      !email
+    ) {
 
       logCell.setValue(
 
@@ -3033,7 +3525,9 @@ function notifyRejectionIfNeeded(
         0
       )
 
-        ? CONFIG.ADMIN_EMAILS.join(",")
+        ? CONFIG.ADMIN_EMAILS.join(
+            ","
+          )
 
         : undefined;
 
@@ -3047,12 +3541,13 @@ function notifyRejectionIfNeeded(
         adminBcc,
 
       subject:
-        "您的換班申請未通過（系統自動退件）",
+        "您的換班／代班／請假申請未通過（系統自動退件）",
 
       body:
+
 `${origPerson} 您好，
 
-您所提出的換班/代班申請經系統檢核後無法通過，原因如下：
+您所提出的值班異動申請經系統檢核後無法通過，原因如下：
 ${message}
 
 請重新確認排班內容後再次提出申請，如有疑問請洽管理員。
@@ -3067,8 +3562,9 @@ ${message}
     );
 
 
-  } catch (err) {
-
+  } catch (
+    err
+  ) {
 
     logCell.setValue(
 
@@ -3089,7 +3585,6 @@ function handleApprovalEditRange(
   range
 ) {
 
-
   const startRow =
     Math.max(
       2,
@@ -3102,7 +3597,8 @@ function handleApprovalEditRange(
 
 
   if (
-    startRow > endRow
+    startRow >
+    endRow
   ) {
 
     return;
@@ -3115,7 +3611,9 @@ function handleApprovalEditRange(
 
 
   if (
-    !lock.tryLock(15000)
+    !lock.tryLock(
+      15000
+    )
   ) {
 
     return;
@@ -3124,16 +3622,13 @@ function handleApprovalEditRange(
 
   try {
 
-
     for (
       let r = startRow;
       r <= endRow;
       r++
     ) {
 
-
       try {
-
 
         handleApprovalEdit(
           sheet,
@@ -3141,11 +3636,14 @@ function handleApprovalEditRange(
         );
 
 
-      } catch (err) {
-
+      } catch (
+        err
+      ) {
 
         console.error(
+
           `第 ${r} 列審核通知處理失敗: ${err.message}`
+
         );
 
 
@@ -3164,7 +3662,6 @@ function handleApprovalEditRange(
 
   } finally {
 
-
     lock.releaseLock();
 
   }
@@ -3179,7 +3676,6 @@ function handleApprovalEdit(
   sheet,
   row
 ) {
-
 
   const approveCheck =
     sheet.getRange(
@@ -3209,14 +3705,17 @@ function handleApprovalEdit(
     true;
 
 
-  if (!isChecked) {
+  if (
+    !isChecked
+  ) {
 
     return;
   }
 
 
   const prevLog =
-    approveLog.getValue()
+    approveLog
+      .getValue()
       .toString();
 
 
@@ -3236,7 +3735,6 @@ function handleApprovalEdit(
     )
   ) {
 
-
     approveCheck.setValue(
       false
     );
@@ -3244,7 +3742,7 @@ function handleApprovalEdit(
 
     approveLog.setValue(
 
-      "尚未成功執行換班（請先勾選L欄，並確認M欄狀態已顯示「已更新日曆」），無法寄送核准通知"
+      "尚未成功執行班表異動（請先勾選L欄，並確認M欄狀態已顯示「已更新日曆」），無法寄送核准通知"
 
     );
 
@@ -3255,7 +3753,6 @@ function handleApprovalEdit(
 
   try {
 
-
     sendApprovalEmail(
       sheet,
       row
@@ -3265,24 +3762,19 @@ function handleApprovalEdit(
     approveLog.setValue(
 
       `已寄送核准通知 ${
-
         Utilities.formatDate(
-
           new Date(),
-
           Session.getScriptTimeZone(),
-
           "yyyy/MM/dd HH:mm"
-
         )
-
       }`
 
     );
 
 
-  } catch (err) {
-
+  } catch (
+    err
+  ) {
 
     approveCheck.setValue(
       false
@@ -3308,7 +3800,6 @@ function sendApprovalEmail(
   row
 ) {
 
-
   const email =
     getApplicantEmail(
       sheet,
@@ -3316,7 +3807,9 @@ function sendApprovalEmail(
     );
 
 
-  if (!email) {
+  if (
+    !email
+  ) {
 
     throw new Error(
       "找不到有效的申請人 Email"
@@ -3376,20 +3869,19 @@ function sendApprovalEmail(
       .trim();
 
 
+  const statusVal =
+    sheet.getRange(
+      row,
+      CONFIG.STATUS_COL
+    )
+      .getValue()
+      .toString();
+
+
   const dateStr =
-    origDate instanceof Date
-
-      ? Utilities.formatDate(
-
-          origDate,
-
-          Session.getScriptTimeZone(),
-
-          "yyyy/MM/dd"
-
-        )
-
-      : origDate;
+    formatDateValue(
+      origDate
+    );
 
 
   const adminBcc =
@@ -3400,25 +3892,27 @@ function sendApprovalEmail(
       0
     )
 
-      ? CONFIG.ADMIN_EMAILS.join(",")
+      ? CONFIG.ADMIN_EMAILS.join(
+          ","
+        )
 
       : undefined;
+
+
+  const hasTarget =
+    hasRealTargetPerson(
+      targetPerson
+    );
 
 
   const isSwap =
     Boolean(
 
+      hasTarget &&
+
       swapDate &&
       swapStartStr &&
-      swapEndStr &&
-
-      targetPerson &&
-
-      targetPerson !==
-        "請假" &&
-
-      targetPerson !==
-        "無"
+      swapEndStr
 
     );
 
@@ -3426,41 +3920,67 @@ function sendApprovalEmail(
   const isSub =
     Boolean(
 
-      !isSwap &&
-
-      targetPerson &&
-
-      targetPerson !==
-        "請假" &&
-
-      targetPerson !==
-        "無"
+      hasTarget &&
+      !isSwap
 
     );
 
 
-  let swapNote =
+  const isLaterSubstitute =
+    statusVal.includes(
+      "後補代班"
+    );
+
+
+  let applicantSubject =
+    "【值班申請】已審核通過";
+
+
+  let applicantDetail =
     "";
 
 
-  if (isSwap) {
+  if (
+    isSwap
+  ) {
+
+    applicantSubject =
+      "【值班換班申請】已審核通過";
 
 
-    swapNote =
+    applicantDetail =
       `（換班對象：${targetPerson}）`;
 
 
-  } else if (isSub) {
+  } else if (
+    isSub
+  ) {
+
+    applicantSubject =
+      isLaterSubstitute
+
+        ? "【值班後補代班】已審核通過"
+
+        : "【值班代班申請】已審核通過";
 
 
-    swapNote =
+    applicantDetail =
       `（代班人：${targetPerson}）`;
 
+
+  } else {
+
+    applicantSubject =
+      "【值班請假申請】已審核通過";
+
+
+    applicantDetail =
+      "";
   }
 
 
   // ==========================================================
-  // 寄給申請人
+  // 申請人
   // ==========================================================
 
   MailApp.sendEmail({
@@ -3472,14 +3992,15 @@ function sendApprovalEmail(
       adminBcc,
 
     subject:
-      "【值班換班申請】已審核通過",
+      applicantSubject,
 
     body:
+
 `${origPerson} 您好，
 
-您於 ${dateStr} ${origStartStr}-${origEndStr} 提出的換班/代班申請${swapNote}已審核通過，並已完成排班異動，新的值班安排已同步至值班日曆。
+您於 ${dateStr} ${origStartStr}-${origEndStr} 提出的值班申請${applicantDetail}已審核通過，並已完成排班異動，新的值班安排已同步至值班日曆。
 
-請留意您的值班時間，如有任何問題歡迎與管理員聯繫。
+請留意您的值班安排，如有任何問題歡迎與管理員聯繫。
 
 （此為系統自動發送信件，請勿直接回覆）`
 
@@ -3490,8 +4011,9 @@ function sendApprovalEmail(
   // 雙向換班 → 通知配合人
   // ==========================================================
 
-  if (isSwap) {
-
+  if (
+    isSwap
+  ) {
 
     const targetEmail =
       getStaffEmailByName(
@@ -3499,23 +4021,14 @@ function sendApprovalEmail(
       );
 
 
-    if (targetEmail) {
-
+    if (
+      targetEmail
+    ) {
 
       const swapDateStr =
-        swapDate instanceof Date
-
-          ? Utilities.formatDate(
-
-              swapDate,
-
-              Session.getScriptTimeZone(),
-
-              "yyyy/MM/dd"
-
-            )
-
-          : swapDate;
+        formatDateValue(
+          swapDate
+        );
 
 
       MailApp.sendEmail({
@@ -3530,6 +4043,7 @@ function sendApprovalEmail(
           "【值班換班申請】您的班表已完成互換",
 
         body:
+
 `${targetPerson} 您好，
 
 您與 ${origPerson} 的換班申請已審核通過：
@@ -3544,11 +4058,12 @@ function sendApprovalEmail(
     }
 
 
-  } else if (isSub) {
-
+  } else if (
+    isSub
+  ) {
 
     // ========================================================
-    // 單向代班 → 通知代班人
+    // 單向代班／後補代班 → 通知代班人
     // ========================================================
 
     const targetEmail =
@@ -3557,8 +4072,9 @@ function sendApprovalEmail(
       );
 
 
-    if (targetEmail) {
-
+    if (
+      targetEmail
+    ) {
 
       MailApp.sendEmail({
 
@@ -3569,9 +4085,15 @@ function sendApprovalEmail(
           adminBcc,
 
         subject:
-          "【值班代班通知】代班已審核通過並排入班表",
+
+          isLaterSubstitute
+
+            ? "【值班後補代班通知】代班已審核通過並排入班表"
+
+            : "【值班代班通知】代班已審核通過並排入班表",
 
         body:
+
 `${targetPerson} 您好，
 
 您協助 ${origPerson} 代班的申請已審核通過：
