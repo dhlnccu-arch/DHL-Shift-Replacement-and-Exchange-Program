@@ -3756,32 +3756,63 @@ function newTransaction_(
   // 原值班人的多段班
   // ----------------------------------------------------------
 
-  analysis.origSegments
-    .forEach(
-      (
-        segment,
-        index
-      ) => {
+analysis.origSegments
+  .forEach(
+    (
+      segment,
+      index
+    ) => {
 
-        plans.push(
+      let detail;
 
-          plan_(
-            segment.event,
-            segment.s,
-            segment.e,
-            firstWorker,
-            tag,
 
-            `${base}-A${index + 1}`,
+      if (
+        analysis.type ===
+        "leave"
+      ) {
 
-            `【${tag}紀錄】\n` +
-            `- 原定值班：${analysis.req.person}\n` +
-            `- 實際安排：${firstWorker}`
-          )
+        detail =
+          `【請假紀錄】\n` +
+          `- 原定值班：${analysis.req.person}\n` +
+          `- 請假狀態：無人代班`;
 
-        );
+      } else if (
+        analysis.type ===
+        "swap"
+      ) {
+
+        detail =
+          `【換班紀錄】\n` +
+          `- 原定值班：${analysis.req.person}\n` +
+          `- 實際到勤：${analysis.req.target}`;
+
+      } else {
+
+        detail =
+          `【代班紀錄】\n` +
+          `- 原定值班：${analysis.req.person}\n` +
+          `- 實際到勤：${analysis.req.target}`;
+
       }
-    );
+
+
+      plans.push(
+
+        plan_(
+          segment.event,
+          segment.s,
+          segment.e,
+          firstWorker,
+          tag,
+
+          `${base}-A${index + 1}`,
+
+          detail
+        )
+
+      );
+    }
+  );
 
 
   // ----------------------------------------------------------
