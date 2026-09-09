@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * 達賢助理代班／換班系統 v6.5.1
+ * 達賢助理代班／換班系統 v6.5.2
  * ============================================================
  *
  * 【用途】
@@ -244,11 +244,22 @@
  * - 快照過大時停止執行，不另外導入 PropertiesService。
  *
  * ============================================================
+ * 十一、v6.5.2 驗收修正
+ * ============================================================
+ *
+ * - T18：同次編輯同時勾 L、N 時，只完成 L；N 自動取消並提示重新勾選。
+ * - T19：正式異動／取消／寄信前檢查 Q 欄 UUID 唯一性。
+ * - T24：APPLIED 後 A–J 視為定案；若被修改，自動恢復核准時快照（兼容 v6.5.1 B–J）。
+ * - 效能：同一次觸發器內快取 UUID→列號，不再讓每個 cell_() 都重讀 Q／getLastRow()。
+ * - 效能：減少 Calendar 新增事件完成後的不必要立即 flush。
+ * - 診斷：加入 [PERF] 執行時間紀錄，方便定位 Sheets/Calendar 延遲。
+ *
+ * ============================================================
  */
 
 
 const CONFIG = {
-  VERSION: "6.5.1",
+  VERSION: "6.5.2",
 
   CALENDAR_NAME: "達賢館創新組助理值班",
 
@@ -280,7 +291,10 @@ const CONFIG = {
   RUN_MS: 240000,
 
   // 留安全餘裕，不逼近 Sheets 註解容量上限。
-  NOTE_LIMIT: 45000
+  NOTE_LIMIT: 45000,
+
+  // 驗收／效能診斷：僅寫入 Apps Script 執行紀錄。
+  PERF_LOG: true
 };
 
 
@@ -736,6 +750,17 @@ function handleSheetEdit(e) {
     e.range.getLastColumn();
 
 
+  const touchesRequestData = (
+
+    lo <= 10
+
+    &&
+
+    hi >= 1
+
+  );
+
+
   const touchesExecute = (
 
     lo <=
@@ -763,6 +788,7 @@ function handleSheetEdit(e) {
 
 
   if (
+    !touchesRequestData &&
     !touchesExecute &&
     !touchesMail
   ) {
@@ -777,6 +803,22 @@ function handleSheetEdit(e) {
       validateConfig_(
         sheet
       );
+
+
+      if (touchesRequestData) {
+        protectAppliedRequestEdits_(
+          e,
+          sheet
+        );
+      }
+
+
+      if (
+        !touchesExecute &&
+        !touchesMail
+      ) {
+        return;
+      }
 
 
       const first =
@@ -867,15 +909,71 @@ function handleSheetEdit(e) {
               getCalendar_();
 
 
+            const rowStartedAt =
+              Date.now();
+
             processSingleRow_(
               c,
               calendar
             );
+
+            perfLog_(
+              "handleSheetEdit row L",
+              rowStartedAt,
+              `row=${r}`
+            );
           }
 
 
-          // L 完成後才處理 N。
+          // L、N 若在同一次編輯中一起被勾選：
+          // 為避免使用者誤以為通知已寄出，本次只完成 L。
+          // N 自動取消，並明確提示重新確認後再勾一次 N。
           if (
+
+            touchesExecute &&
+            touchesMail &&
+
+            cell_(
+              c,
+              CONFIG.APPROVE_CHECK_COL
+            ).getValue() ===
+              true
+
+          ) {
+
+            cell_(
+              c,
+              CONFIG.APPROVE_CHECK_COL
+            ).setValue(false);
+
+            const currentStatus =
+              text_(
+                cell_(
+                  c,
+                  CONFIG.STATUS_COL
+                ).getValue()
+              );
+
+            if (
+              currentStatus.startsWith(
+                "已更新日曆"
+              )
+            ) {
+
+              status_(
+                c,
+                currentStatus +
+                "；核准通知尚未寄送，請確認後重新勾選 N"
+              );
+
+              sheet
+                .getParent()
+                .toast(
+                  `第 ${r} 列：班表已更新；通知尚未寄送，請重新勾選 N。`
+                );
+            }
+
+          } else if (
 
             touchesMail
 
@@ -962,6 +1060,25 @@ function now_() {
 }
 
 
+// ============================================================
+// 效能診斷
+// ============================================================
+
+function perfLog_(label, startedAt, extra) {
+
+  if (!CONFIG.PERF_LOG) {
+    return;
+  }
+
+  const ms = Date.now() - startedAt;
+
+  console.log(
+    `[PERF] ${label}: ${ms} ms` +
+    (extra ? ` | ${extra}` : "")
+  );
+}
+
+
 function hash_(value) {
 
   return Utilities.base64EncodeWebSafe(
@@ -1028,7 +1145,8 @@ function readNote_(
 
 function writeNote_(
   cell,
-  value
+  value,
+  flushNow = true
 ) {
 
   const note =
@@ -1055,8 +1173,20 @@ function writeNote_(
   );
 
 
-  // 交易快照必須在下一個 Calendar API 動作前可靠寫入。
-  SpreadsheetApp.flush();
+  // 交易快照在「下一個 Calendar API 動作前」必須可靠寫入。
+  // 某些 Calendar 動作完成後的狀態，可延後到下一個必要 checkpoint 再 flush。
+  if (flushNow) {
+
+    const startedAt =
+      Date.now();
+
+    SpreadsheetApp.flush();
+
+    perfLog_(
+      "SpreadsheetApp.flush",
+      startedAt
+    );
+  }
 }
 
 
@@ -1138,7 +1268,7 @@ function context_(
 // ============================================================
 // UUID → 實際列號
 //
-// v6.5.1 效能優化：
+// v6.5.2 效能優化：
 //
 // 1. 先使用 c.r 快取列號。
 // 2. 只讀取目前列 Q 的單一儲存格確認 UUID。
@@ -1148,61 +1278,59 @@ function context_(
 
 function row_(c) {
 
-  const lastRow =
-    c.s.getLastRow();
-
+  // 同一次觸發器內，Context 建立時已驗證過列號。
+  // 後續 cell_() 不再反覆讀 Q 儲存格，可大幅減少 Sheets RPC。
+  if (
+    c._rowVerified === true &&
+    Number.isInteger(c.r) &&
+    c.r >= 2
+  ) {
+    return c.r;
+  }
 
   // ----------------------------------------------------------
   // 快速路徑：
-  // 目前快取列仍存在，且 Q 欄 UUID 沒變。
+  // 不再每次先呼叫 getLastRow()。
+  // 目前列仍存在且 Q 欄 UUID 相符時，直接使用。
   // ----------------------------------------------------------
 
   if (
-
-    Number.isInteger(
-      c.r
-    )
-
-    &&
-
+    Number.isInteger(c.r) &&
     c.r >= 2
-
-    &&
-
-    c.r <= lastRow
-
   ) {
 
-    const currentId =
-      text_(
-        c.s
-          .getRange(
-            c.r,
-            CONFIG.REQUEST_ID_COL
-          )
-          .getValue()
-      );
+    try {
 
+      const currentId =
+        text_(
+          c.s
+            .getRange(
+              c.r,
+              CONFIG.REQUEST_ID_COL
+            )
+            .getValue()
+        );
 
-    if (
-      currentId ===
-      c.id
-    ) {
+      if (currentId === c.id) {
+        c._rowVerified = true;
+        return c.r;
+      }
 
-      return c.r;
+    } catch (_) {
+      // 可能剛好遇到列被刪除／移動，改走慢速路徑。
     }
   }
 
 
   // ----------------------------------------------------------
   // 慢速路徑：
-  // 快取位置已不正確，才重新掃描 Q 欄。
+  // 快取位置已不正確，才取得 lastRow 並掃描整個 Q 欄。
   // ----------------------------------------------------------
 
-  if (
-    lastRow < 2
-  ) {
+  const lastRow =
+    c.s.getLastRow();
 
+  if (lastRow < 2) {
     throw new Error(
       "找不到申請資料。"
     );
@@ -1228,9 +1356,7 @@ function row_(c) {
     (value, index) => {
 
       if (
-        text_(
-          value[0]
-        ) ===
+        text_(value[0]) ===
         c.id
       ) {
 
@@ -1242,9 +1368,7 @@ function row_(c) {
   );
 
 
-  if (
-    matches.length !== 1
-  ) {
+  if (matches.length !== 1) {
 
     throw new Error(
       "申請 ID 遺失或重複，請勿複製 Q 欄。"
@@ -1254,6 +1378,9 @@ function row_(c) {
 
   c.r =
     matches[0];
+
+  c._rowVerified =
+    true;
 
 
   return c.r;
@@ -1291,6 +1418,274 @@ function status_(
 
 
 // ============================================================
+// Q 欄 UUID 唯一性
+//
+// row_() 的快速路徑只負責「目前 Context 是否仍在正確列」。
+// 真正要異動 Calendar／寄信時，再做一次全欄唯一性檢查。
+// 這樣兼顧正常操作效能與複製列的防呆。
+// ============================================================
+
+function assertUniqueRequestId_(c) {
+
+  const startedAt =
+    Date.now();
+
+  const lastRow =
+    c.s.getLastRow();
+
+  if (lastRow < 2) {
+    throw new Error(
+      "找不到申請資料。"
+    );
+  }
+
+  const values =
+    c.s
+      .getRange(
+        2,
+        CONFIG.REQUEST_ID_COL,
+        lastRow - 1,
+        1
+      )
+      .getDisplayValues();
+
+  let count = 0;
+
+  for (const row of values) {
+    if (text_(row[0]) === c.id) {
+      count++;
+      if (count > 1) {
+        break;
+      }
+    }
+  }
+
+  perfLog_(
+    "UUID unique check",
+    startedAt,
+    `rows=${lastRow - 1}`
+  );
+
+  if (count !== 1) {
+    throw new Error(
+      "申請 ID 遺失或重複，系統已停止執行；請勿複製 Q 欄或整筆申請資料。"
+    );
+  }
+
+  // 唯一性確認後，本次執行可安全沿用目前列快取。
+  c._rowVerified = true;
+}
+
+
+// ============================================================
+// 核准時 A–J 原始列快照
+// ============================================================
+
+function encodeSheetValue_(value) {
+
+  if (value instanceof Date) {
+    return {
+      type: "date",
+      value: +value
+    };
+  }
+
+  return {
+    type: "value",
+    value: value
+  };
+}
+
+
+function decodeSheetValue_(entry) {
+
+  if (
+    entry &&
+    entry.type === "date"
+  ) {
+    return new Date(entry.value);
+  }
+
+  return entry
+    ? entry.value
+    : "";
+}
+
+
+function captureSheetSnapshot_(sheet, r) {
+
+  return sheet
+    .getRange(r, 1, 1, 10)
+    .getValues()[0]
+    .map(encodeSheetValue_);
+}
+
+
+function legacySheetValuesFromReq_(c, st) {
+
+  if (!st.req) {
+    throw new Error(
+      "此舊案件沒有可用的申請快照。"
+    );
+  }
+
+  const req = st.req;
+
+  // v6.5.1 舊交易沒有保存 A 欄 timestamp，
+  // 因此僅保留目前 A 欄；B–J 依核准時 req 還原。
+  const timestamp =
+    c.s
+      .getRange(
+        row_(c),
+        1
+      )
+      .getValue();
+
+  const dateValue =
+    value =>
+      value
+        ? parseTime_(value, "00:00")
+        : "";
+
+  const timeValue =
+    value =>
+      value
+        ? parseTime_("1899/12/30", value)
+        : "";
+
+  return [
+    timestamp,
+    req.person || "",
+    dateValue(req.date),
+    timeValue(req.start),
+    timeValue(req.end),
+    req.target || "",
+    dateValue(req.swapDate),
+    timeValue(req.swapStart),
+    timeValue(req.swapEnd),
+    req.memo || ""
+  ];
+}
+
+
+function restoreSheetSnapshot_(c, st) {
+
+  let values;
+
+  if (
+    Array.isArray(st.sheetSnapshot) &&
+    st.sheetSnapshot.length === 10
+  ) {
+
+    values =
+      st.sheetSnapshot.map(
+        decodeSheetValue_
+      );
+
+  } else {
+
+    values =
+      legacySheetValuesFromReq_(
+        c,
+        st
+      );
+  }
+
+  c.s
+    .getRange(
+      row_(c),
+      1,
+      1,
+      10
+    )
+    .setValues([values]);
+}
+
+
+function protectAppliedRequestEdits_(e, sheet) {
+
+  const firstRow =
+    Math.max(2, e.range.getRow());
+
+  const lastRow =
+    Math.min(
+      e.range.getLastRow(),
+      sheet.getLastRow()
+    );
+
+  let blocked = 0;
+
+  for (
+    let r = firstRow;
+    r <= lastRow;
+    r++
+  ) {
+
+    const id =
+      text_(
+        sheet
+          .getRange(
+            r,
+            CONFIG.REQUEST_ID_COL
+          )
+          .getValue()
+      );
+
+    if (!id) {
+      continue;
+    }
+
+    const c = {
+      s: sheet,
+      r: r,
+      id: id
+    };
+
+    const st =
+      state_(c);
+
+    if (
+      !st ||
+      st.phase !== ACTIVE_PHASE
+    ) {
+      continue;
+    }
+
+    try {
+      restoreSheetSnapshot_(c, st);
+
+      status_(
+        c,
+        appliedText_(st) +
+        "；已阻止修改已核准的 A–J 申請內容"
+      );
+
+      blocked++;
+
+    } catch (err) {
+
+      status_(
+        c,
+        appliedText_(st) +
+        "；已偵測核准後內容被修改：" +
+        err.message
+      );
+
+      throw err;
+    }
+  }
+
+  if (blocked > 0) {
+    sheet
+      .getParent()
+      .toast(
+        `已阻止 ${blocked} 筆已核准案件修改 A–J；如需更正，請先取消 L，再重新送件。`
+      );
+  }
+}
+
+
+// ============================================================
 // 交易狀態
 // ============================================================
 
@@ -1323,7 +1718,8 @@ function state_(c) {
 
 function saveState_(
   c,
-  st
+  st,
+  flushNow = true
 ) {
 
   st.updated =
@@ -1335,7 +1731,8 @@ function saveState_(
       c,
       CONFIG.REQUEST_ID_COL
     ),
-    st
+    st,
+    flushNow
   );
 }
 
@@ -1349,8 +1746,14 @@ function assertNoPending_(
   ownId
 ) {
 
+  const startedAt =
+    Date.now();
+
+  const lastRow =
+    sheet.getLastRow();
+
   if (
-    sheet.getLastRow() < 2
+    lastRow < 2
   ) {
 
     return;
@@ -1362,7 +1765,7 @@ function assertNoPending_(
       .getRange(
         2,
         CONFIG.REQUEST_ID_COL,
-        sheet.getLastRow() - 1,
+        lastRow - 1,
         1
       )
       .getNotes();
@@ -1425,9 +1828,13 @@ function assertNoPending_(
       }
     }
   );
+
+  perfLog_(
+    "assertNoPending",
+    startedAt,
+    `rows=${Math.max(0, lastRow - 1)}`
+  );
 }
-
-
 // ============================================================
 // 是否為真正的代班／換班人
 // ============================================================
@@ -2189,6 +2596,10 @@ function analyzeRequest(
   r
 ) {
 
+  const analysisStartedAt =
+    Date.now();
+
+
   const req =
     readRequest_(
       sheet,
@@ -2200,14 +2611,23 @@ function analyzeRequest(
     (
       code,
       message
-    ) => ({
+    ) => {
 
-      ok: false,
-      code: code,
-      message: message,
-      req: req
+      perfLog_(
+        "analyzeRequest",
+        analysisStartedAt,
+        `row=${r} result=${code}`
+      );
 
-    });
+      return {
+
+        ok: false,
+        code: code,
+        message: message,
+        req: req
+
+      };
+    };
 
 
   const hasTarget =
@@ -2372,11 +2792,22 @@ function analyzeRequest(
   // 原值班：允許多段。
   // ----------------------------------------------------------
 
+  const originalEventsStartedAt =
+    Date.now();
+
+
   const originalEvents =
     calendar.getEvents(
       originalStart,
       originalEnd
     );
+
+
+  perfLog_(
+    "Calendar.getEvents original",
+    originalEventsStartedAt,
+    `row=${r} events=${originalEvents.length}`
+  );
 
 
   const originalResult =
@@ -2429,11 +2860,22 @@ function analyzeRequest(
     "swap"
   ) {
 
+    const targetEventsStartedAt =
+      Date.now();
+
+
     const targetEvents =
       calendar.getEvents(
         swapStart,
         swapEnd
       );
+
+
+    perfLog_(
+      "Calendar.getEvents swap",
+      targetEventsStartedAt,
+      `row=${r} events=${targetEvents.length}`
+    );
 
 
     const targetResult =
@@ -2549,7 +2991,7 @@ function analyzeRequest(
     );
 
 
-  return {
+  const result = {
 
     ok: true,
 
@@ -2573,6 +3015,16 @@ function analyzeRequest(
           state === "請假"
       )
   };
+
+
+  perfLog_(
+    "analyzeRequest",
+    analysisStartedAt,
+    `row=${r} result=OK type=${type} origSegments=${origSegments.length} swapSegments=${swapSegments.length}`
+  );
+
+
+  return result;
 }
 
 
@@ -2865,8 +3317,6 @@ function composeDesc_(
     previousText
   ).trim();
 }
-
-
 // ============================================================
 // 從舊 description 讀取 metadata
 // ============================================================
@@ -3414,6 +3864,20 @@ function putSnapshot_(
       normalized.desc
     );
   }
+
+
+  if (
+    (
+      event.getLocation() ||
+      ""
+    ) !==
+    normalized.location
+  ) {
+
+    event.setLocation(
+      normalized.location
+    );
+  }
 }
 
 
@@ -3756,63 +4220,62 @@ function newTransaction_(
   // 原值班人的多段班
   // ----------------------------------------------------------
 
-analysis.origSegments
-  .forEach(
-    (
-      segment,
-      index
-    ) => {
+  analysis.origSegments
+    .forEach(
+      (
+        segment,
+        index
+      ) => {
 
-      let detail;
+        let detail;
 
 
-      if (
-        analysis.type ===
-        "leave"
-      ) {
+        if (
+          analysis.type ===
+          "leave"
+        ) {
 
-        detail =
-          `【請假紀錄】\n` +
-          `- 原定值班：${analysis.req.person}\n` +
-          `- 請假狀態：無人代班`;
+          detail =
+            `【請假紀錄】\n` +
+            `- 原定值班：${analysis.req.person}\n` +
+            `- 請假狀態：無人代班`;
 
-      } else if (
-        analysis.type ===
-        "swap"
-      ) {
+        } else if (
+          analysis.type ===
+          "swap"
+        ) {
 
-        detail =
-          `【換班紀錄】\n` +
-          `- 原定值班：${analysis.req.person}\n` +
-          `- 實際到勤：${analysis.req.target}`;
+          detail =
+            `【換班紀錄】\n` +
+            `- 原定值班：${analysis.req.person}\n` +
+            `- 實際到勤：${analysis.req.target}`;
 
-      } else {
+        } else {
 
-        detail =
-          `【代班紀錄】\n` +
-          `- 原定值班：${analysis.req.person}\n` +
-          `- 實際到勤：${analysis.req.target}`;
+          detail =
+            `【代班紀錄】\n` +
+            `- 原定值班：${analysis.req.person}\n` +
+            `- 實際到勤：${analysis.req.target}`;
+        }
 
+
+        plans.push(
+
+          plan_(
+            segment.event,
+            segment.s,
+            segment.e,
+            firstWorker,
+            tag,
+
+            `${base}-A${index + 1}`,
+
+            detail
+          )
+
+        );
       }
-
-
-      plans.push(
-
-        plan_(
-          segment.event,
-          segment.s,
-          segment.e,
-          firstWorker,
-          tag,
-
-          `${base}-A${index + 1}`,
-
-          detail
-        )
-
-      );
-    }
-  );
+    );
 
 
   // ----------------------------------------------------------
@@ -3881,6 +4344,12 @@ analysis.origSegments
         analysis.req
       ),
 
+    sheetSnapshot:
+      captureSheetSnapshot_(
+        c.s,
+        row_(c)
+      ),
+
     type:
       analysis.type,
 
@@ -3897,8 +4366,6 @@ analysis.origSegments
       ""
   };
 }
-
-
 // ============================================================
 // 正式處理單筆 L
 // ============================================================
@@ -3907,6 +4374,15 @@ function processSingleRow_(
   c,
   calendar
 ) {
+
+  const processStartedAt =
+    Date.now();
+
+
+  assertUniqueRequestId_(
+    c
+  );
+
 
   let st =
     state_(c);
@@ -3936,9 +4412,20 @@ function processSingleRow_(
   }
 
 
+  const pendingStartedAt =
+    Date.now();
+
+
   assertNoPending_(
     c.s,
     c.id
+  );
+
+
+  perfLog_(
+    "processSingleRow assertNoPending",
+    pendingStartedAt,
+    `row=${row_(c)}`
   );
 
 
@@ -3970,6 +4457,12 @@ function processSingleRow_(
   ) {
 
     if (checked) {
+
+      perfLog_(
+        "processSingleRow",
+        processStartedAt,
+        `row=${row_(c)} legacy-kept`
+      );
 
       return;
     }
@@ -4018,6 +4511,13 @@ function processSingleRow_(
         appliedText_(st)
       );
 
+
+      perfLog_(
+        "processSingleRow",
+        processStartedAt,
+        `row=${row_(c)} already-applied`
+      );
+
       return;
     }
 
@@ -4025,11 +4525,22 @@ function processSingleRow_(
     // L 被取消 → 嘗試完整還原。
     try {
 
+      const eventsStartedAt =
+        Date.now();
+
+
       const events =
         eventsForTx_(
           calendar,
           st
         );
+
+
+      perfLog_(
+        "eventsForTx undo",
+        eventsStartedAt,
+        `row=${row_(c)} events=${events.length}`
+      );
 
 
       preflightUndo_(
@@ -4053,6 +4564,10 @@ function processSingleRow_(
       );
 
 
+      const restoreStartedAt =
+        Date.now();
+
+
       restoreTransaction_(
         c,
         calendar,
@@ -4062,9 +4577,23 @@ function processSingleRow_(
       );
 
 
+      perfLog_(
+        "restoreTransaction undo",
+        restoreStartedAt,
+        `row=${row_(c)}`
+      );
+
+
       finishRestore_(
         c,
         st
+      );
+
+
+      perfLog_(
+        "processSingleRow",
+        processStartedAt,
+        `row=${row_(c)} undone`
       );
 
     } catch (err) {
@@ -4109,6 +4638,13 @@ function processSingleRow_(
           err
         );
       }
+
+
+      perfLog_(
+        "processSingleRow",
+        processStartedAt,
+        `row=${row_(c)} undo-error=${err.message}`
+      );
     }
 
 
@@ -4117,6 +4653,12 @@ function processSingleRow_(
 
 
   if (!checked) {
+
+    perfLog_(
+      "processSingleRow",
+      processStartedAt,
+      `row=${row_(c)} unchecked`
+    );
 
     return;
   }
@@ -4149,12 +4691,23 @@ function processSingleRow_(
   // 再次讀取最新 Calendar。
   // ----------------------------------------------------------
 
+  const analysisStartedAt =
+    Date.now();
+
+
   const analysis =
     analyzeRequest(
       c.s,
       calendar,
       row_(c)
     );
+
+
+  perfLog_(
+    "processSingleRow analyze",
+    analysisStartedAt,
+    `row=${row_(c)}`
+  );
 
 
   if (
@@ -4165,6 +4718,13 @@ function processSingleRow_(
       c,
       analysis,
       "正式審核"
+    );
+
+
+    perfLog_(
+      "processSingleRow",
+      processStartedAt,
+      `row=${row_(c)} rejected`
     );
 
     return;
@@ -4208,6 +4768,10 @@ function processSingleRow_(
 
   try {
 
+    const calendarWriteStartedAt =
+      Date.now();
+
+
     for (
       let index = 0;
       index < st.plans.length;
@@ -4241,15 +4805,28 @@ function processSingleRow_(
         true;
 
 
+      // 在真正修改 Calendar 前，
+      // touched 狀態必須可靠寫入。
       saveState_(
         c,
         st
       );
 
 
+      const putMainStartedAt =
+        Date.now();
+
+
       putSnapshot_(
         event,
         p.after
+      );
+
+
+      perfLog_(
+        "Calendar putSnapshot main",
+        putMainStartedAt,
+        `row=${row_(c)} plan=${index + 1}`
       );
 
 
@@ -4266,6 +4843,7 @@ function processSingleRow_(
           "CREATING";
 
 
+        // createEvent 前必須先保存 CREATING checkpoint。
         saveState_(
           c,
           st
@@ -4276,6 +4854,10 @@ function processSingleRow_(
 
 
         try {
+
+          const createStartedAt =
+            Date.now();
+
 
           created =
             calendar.createEvent(
@@ -4297,6 +4879,13 @@ function processSingleRow_(
                   addition.want.location
               }
             );
+
+
+          perfLog_(
+            "Calendar.createEvent",
+            createStartedAt,
+            `row=${row_(c)}`
+          );
 
         } catch (err) {
 
@@ -4335,10 +4924,17 @@ function processSingleRow_(
           "CREATED_UNTAGGED";
 
 
+        // 這裡已取得 created.getId()，
+        // 但下一步仍要寫入 Tag／快照。
+        // 先保存 id，確保若下一步失敗仍可尋回事 件。
         saveState_(
           c,
           st
         );
+
+
+        const putCreatedStartedAt =
+          Date.now();
 
 
         putSnapshot_(
@@ -4347,22 +4943,43 @@ function processSingleRow_(
         );
 
 
+        perfLog_(
+          "Calendar putSnapshot created",
+          putCreatedStartedAt,
+          `row=${row_(c)}`
+        );
+
+
         addition.stage =
           "CREATED";
 
 
+        // v6.5.2：
+        // Calendar Event 已完整建立且 metadata 已寫入。
+        // 此處不強制立即 flush，
+        // 下一個需要 Calendar 風險動作前會再建立 checkpoint；
+        // 若這是最後一步，後續 APPLIED saveState_ 會 flush。
         saveState_(
           c,
-          st
+          st,
+          false
         );
       }
     }
+
+
+    perfLog_(
+      "Calendar apply total",
+      calendarWriteStartedAt,
+      `row=${row_(c)} plans=${st.plans.length}`
+    );
 
 
     st.phase =
       ACTIVE_PHASE;
 
 
+    // 最終 APPLIED 狀態必須可靠寫入。
     saveState_(
       c,
       st
@@ -4380,6 +4997,13 @@ function processSingleRow_(
       CONFIG.EXECUTE_CHECK_COL
     ).setNote(
       ""
+    );
+
+
+    perfLog_(
+      "processSingleRow",
+      processStartedAt,
+      `row=${row_(c)} applied`
     );
 
   } catch (err) {
@@ -4404,15 +5028,41 @@ function processSingleRow_(
       );
 
 
+      const rollbackEventsStartedAt =
+        Date.now();
+
+
+      const rollbackEvents =
+        eventsForTx_(
+          calendar,
+          st
+        );
+
+
+      perfLog_(
+        "eventsForTx rollback",
+        rollbackEventsStartedAt,
+        `row=${row_(c)} events=${rollbackEvents.length}`
+      );
+
+
+      const rollbackStartedAt =
+        Date.now();
+
+
       restoreTransaction_(
         c,
         calendar,
         st,
-        eventsForTx_(
-          calendar,
-          st
-        ),
+        rollbackEvents,
         false
+      );
+
+
+      perfLog_(
+        "restoreTransaction rollback",
+        rollbackStartedAt,
+        `row=${row_(c)}`
       );
 
 
@@ -4431,6 +5081,13 @@ function processSingleRow_(
         recoveryError
       );
     }
+
+
+    perfLog_(
+      "processSingleRow",
+      processStartedAt,
+      `row=${row_(c)} apply-error=${err.message}`
+    );
   }
 }
 
@@ -5108,6 +5765,11 @@ function preflightUndo_(
   events
 ) {
 
+  assertUniqueRequestId_(
+    c
+  );
+
+
   assertAppliedIntact_(
     c,
     st,
@@ -5286,7 +5948,18 @@ function restoreTransaction_(
           );
 
 
+          const deleteStartedAt =
+            Date.now();
+
+
           event.deleteEvent();
+
+
+          perfLog_(
+            "Calendar.deleteEvent",
+            deleteStartedAt,
+            `row=${row_(c)}`
+          );
 
 
           // 從同一次 getEvents() 的記憶體清單移除，
@@ -5304,9 +5977,11 @@ function restoreTransaction_(
           "DELETED";
 
 
+        // 刪除成功後的狀態可延後到下一個必要 checkpoint。
         saveState_(
           c,
-          st
+          st,
+          false
         );
       }
 
@@ -5315,9 +5990,20 @@ function restoreTransaction_(
       // 再精確恢復主 Event。
       // ------------------------------------------------------
 
+      const restoreMainStartedAt =
+        Date.now();
+
+
       putSnapshot_(
         main,
         p.before
+      );
+
+
+      perfLog_(
+        "Calendar restore main",
+        restoreMainStartedAt,
+        `row=${row_(c)}`
       );
 
 
@@ -5325,9 +6011,13 @@ function restoreTransaction_(
         true;
 
 
+      // 下一個 plan 若還要動 Calendar，
+      // 下一次 saveState_ 會建立可靠 checkpoint；
+      // 若這是最後 plan，finishRestore_ 會 flush。
       saveState_(
         c,
-        st
+        st,
+        false
       );
 
     } catch (err) {
@@ -5371,6 +6061,7 @@ function finishRestore_(
       : "ROLLED_BACK";
 
 
+  // 最終狀態必須可靠保存。
   saveState_(
     c,
     st
@@ -5492,8 +6183,6 @@ function markRecovery_(
     st.error
   );
 }
-
-
 // ============================================================
 // 舊版 v6.2 / v6.3 成功案件安全匯入
 // ============================================================
@@ -5585,6 +6274,7 @@ function adoptLegacy_(
       token:
         c.id +
         "-B"
+
     });
   }
 
@@ -5788,14 +6478,14 @@ function adoptLegacy_(
 
           Number(
             w.s >
-            before.s
+              before.s
           )
 
           +
 
           Number(
             w.e <
-            before.e
+              before.e
           );
 
 
@@ -5816,7 +6506,7 @@ function adoptLegacy_(
             .filter(
               event =>
                 event !==
-                main
+                  main
             )
 
             .map(
@@ -5907,6 +6597,12 @@ function adoptLegacy_(
     requestHash:
       hash_(
         req
+      ),
+
+    sheetSnapshot:
+      captureSheetSnapshot_(
+        c.s,
+        row_(c)
       ),
 
     type:
@@ -6268,6 +6964,11 @@ function approval_(
   c,
   deadline
 ) {
+
+  assertUniqueRequestId_(
+    c
+  );
+
 
   assertNoPending_(
     c.s,
@@ -6669,8 +7370,6 @@ function approval_(
     deadline
   );
 }
-
-
 // ============================================================
 // 預檢／正式審核退件
 // ============================================================
@@ -7225,6 +7924,11 @@ function retrySelectedNotifications() {
         selected_();
 
 
+      assertUniqueRequestId_(
+        c
+      );
+
+
       const st =
         state_(c);
 
@@ -7541,8 +8245,6 @@ function resolveSelectedMail() {
     "核對紀錄已保存。請再用「重試此列未完成通知」更新顯示並補寄。"
   );
 }
-
-
 // ============================================================
 // 班表工具：復原中斷交易
 // ============================================================
@@ -7554,6 +8256,11 @@ function recoverSelectedCalendar() {
 
       const c =
         selected_();
+
+
+      assertUniqueRequestId_(
+        c
+      );
 
 
       const st =
@@ -7653,6 +8360,11 @@ function confirmSelectedRecovery() {
 
       const c =
         selected_();
+
+
+      assertUniqueRequestId_(
+        c
+      );
 
 
       const st =
@@ -7772,6 +8484,11 @@ function cleanSelectedCalendarDisplay() {
 
       const c =
         selected_();
+
+
+      assertUniqueRequestId_(
+        c
+      );
 
 
       const st =
