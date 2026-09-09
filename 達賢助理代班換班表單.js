@@ -1,50 +1,9 @@
-/**
- * 達賢助理代班／換班系統 v6.3
- * 異常復原與逐封通知版
- *
- * 取代整套舊程式，不要接在舊程式後面。
- *
- * A–K：原表單資料
- * L：審核確認
- * M：執行狀態
- * N：審核通知
- * O：核准通知紀錄
- * P：退件通知紀錄
- * Q：申請 ID
- *
- * Q 儲存格註解：保存異動快照
- * O／P 儲存格註解：保存逐封寄信紀錄
- *
- * 請勿刪除 Q、O、P 的內容或註解。
- * 請勿只排序部分欄位。
- *
- * 保留兩個安裝式觸發器：
- *
- * handleSheetEdit
- * → 試算表 → 編輯時
- *
- * onFormSubmitPrecheck
- * → 試算表 → 提交表單時
- *
- * 系統錯誤不是申請退件。
- * API 結果不明時停住等待人工核對，
- * 不假稱全部成功或全部還原。
- * 郵件結果不明時也不盲目重寄。
- */
-
 const CONFIG = {
-  VERSION: "6.3",
-
+  VERSION: "6.5",
   CALENDAR_NAME: "達賢館創新組助理值班",
-
-  // 有同名日曆時，才需要填入正確日曆 ID。
   CALENDAR_ID: "",
-
-  // 空白時，依 K／L／N 欄標題辨識回覆分頁。
   RESPONSE_SHEET_NAME: "",
-
   TIME_ZONE: "Asia/Taipei",
-
   APPLICANT_EMAIL_COL: 11,
   EXECUTE_CHECK_COL: 12,
   STATUS_COL: 13,
@@ -52,13 +11,10 @@ const CONFIG = {
   APPROVE_LOG_COL: 15,
   REJECT_LOG_COL: 16,
   REQUEST_ID_COL: 17,
-
   ADMIN_EMAILS: ["dhl.nccu@gmail.com"],
-
   STAFF_DIRECTORY_SHEET_NAME: "員工名冊",
   STAFF_NAME_COL: 1,
   STAFF_EMAIL_COL: 2,
-
   MAX_ROWS: 30,
   RUN_MS: 240000,
   NOTE_LIMIT: 45000
@@ -72,10 +28,12 @@ const OPEN_PHASES = [
 
 const ACTIVE_PHASE = "APPLIED";
 
+const EVENT_TAGS = {
+  ROW_ID: "DHL_ROW_ID",
+  PART_ID: "DHL_PART_ID",
+  VERSION: "DHL_META_VERSION"
+};
 
-// ============================================================
-// 選單與入口
-// ============================================================
 
 function onOpen() {
   SpreadsheetApp.getUi()
@@ -96,6 +54,11 @@ function onOpen() {
     .addItem(
       "人工核對原班後解除此列鎖定",
       "confirmSelectedRecovery"
+    )
+    .addSeparator()
+    .addItem(
+      "清理所選申請的日曆顯示",
+      "cleanSelectedCalendarDisplay"
     )
     .addToUi();
 }
@@ -211,10 +174,6 @@ function getCalendar_() {
 }
 
 
-// ============================================================
-// 表單提交：只做預檢，不改班表
-// ============================================================
-
 function onFormSubmitPrecheck(e) {
   if (!e || !e.range) return;
 
@@ -237,7 +196,6 @@ function onFormSubmitPrecheck(e) {
 
     const st = state_(c);
 
-    // 延遲或重複觸發，不得蓋掉已執行或已取消的結果。
     if (
       st ||
       text_(
@@ -283,10 +241,6 @@ function onFormSubmitPrecheck(e) {
   });
 }
 
-
-// ============================================================
-// 編輯事件：同一把鎖，逐列 L 在前、N 在後
-// ============================================================
 
 function handleSheetEdit(e) {
   if (!e || !e.range) return;
@@ -359,7 +313,6 @@ function handleSheetEdit(e) {
           );
         }
 
-        // L 執行完，才處理同列 N。
         if (
           touchesMail &&
           cell_(
@@ -376,8 +329,6 @@ function handleSheetEdit(e) {
       } catch (err) {
         console.error(err);
 
-        // 不把已成功狀態改成失敗。
-        // 操作錯誤寫入 L 儲存格註解。
         sheet.getRange(
           r,
           CONFIG.EXECUTE_CHECK_COL
@@ -393,10 +344,6 @@ function handleSheetEdit(e) {
   });
 }
 
-
-// ============================================================
-// 共用工具：UUID、狀態、快照
-// ============================================================
 
 function text_(value) {
   return value == null
@@ -507,7 +454,6 @@ function context_(sheet, r) {
     id: id
   };
 
-  // 同時檢查 UUID 是否重複。
   row_(c);
 
   return c;
@@ -594,7 +540,6 @@ function saveState_(c, st) {
 }
 
 
-// 若有其他未完成的日曆異動，暫停新的正式異動。
 function assertNoPending_(sheet, ownId) {
   if (sheet.getLastRow() < 2) return;
 
@@ -635,10 +580,6 @@ function assertNoPending_(sheet, ownId) {
   });
 }
 
-
-// ============================================================
-// 讀取申請與嚴格時間解析
-// ============================================================
 
 function hasRealTargetPerson(value) {
   value = text_(value);
@@ -764,10 +705,6 @@ function parseTime_(date, time) {
 }
 
 
-// ============================================================
-// Calendar 標題解析
-// ============================================================
-
 function titleInfo_(title) {
   let raw = text_(title);
 
@@ -812,15 +749,160 @@ function overlap_(start1, end1, start2, end2) {
 }
 
 
-// ============================================================
-// 共用檢核：每次重新查當下 Calendar
-// ============================================================
+function buildSegments_(events, name, start, end, label) {
+  const matched = events
+    .filter(event =>
+      titleInfo_(event.getTitle()).name === name &&
+      overlap_(
+        +start,
+        +end,
+        +event.getStartTime(),
+        +event.getEndTime()
+      )
+    )
+    .sort((a, b) =>
+      +a.getStartTime() - +b.getStartTime()
+    );
+
+  if (matched.length === 0) {
+    return {
+      ok: false,
+      message: `找不到 ${name} 的${label}。`
+    };
+  }
+
+  if (matched.some(event => event.isAllDayEvent())) {
+    return {
+      ok: false,
+      message: `${name} 的${label}包含全天事件，請管理員確認。`
+    };
+  }
+
+  if (
+    +start < +matched[0].getStartTime() ||
+    +end > +matched[matched.length - 1].getEndTime()
+  ) {
+    return {
+      ok: false,
+      message:
+        `${name} 的申請起訖時間超出實際${label}範圍；` +
+        "中間空檔可以保留，但起點與終點必須落在原班內。"
+    };
+  }
+
+  for (let i = 1; i < matched.length; i++) {
+    if (
+      +matched[i].getStartTime() <
+      +matched[i - 1].getEndTime()
+    ) {
+      return {
+        ok: false,
+        message:
+          `${name} 在申請範圍內有互相重疊的多筆行程，請管理員確認。`
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    segments: matched.map(event => ({
+      event: event,
+      s: Math.max(+start, +event.getStartTime()),
+      e: Math.min(+end, +event.getEndTime())
+    }))
+  };
+}
+
+
+function sameCalendarOccurrence_(a, b) {
+  return (
+    a &&
+    b &&
+    a.getId() === b.getId() &&
+    +a.getStartTime() === +b.getStartTime() &&
+    +a.getEndTime() === +b.getEndTime()
+  );
+}
+
+
+function intervalCoveredByCeding_(
+  event,
+  overlapStart,
+  overlapEnd,
+  cedingSegments
+) {
+  const ranges = (cedingSegments || [])
+    .filter(segment =>
+      sameCalendarOccurrence_(
+        event,
+        segment.event
+      )
+    )
+    .map(segment => [segment.s, segment.e])
+    .sort((a, b) => a[0] - b[0]);
+
+  if (!ranges.length) return false;
+
+  let cursor = overlapStart;
+
+  for (const range of ranges) {
+    if (range[1] <= cursor) continue;
+    if (range[0] > cursor) return false;
+
+    cursor = Math.max(cursor, range[1]);
+
+    if (cursor >= overlapEnd) {
+      return true;
+    }
+  }
+
+  return cursor >= overlapEnd;
+}
+
+
+function findConflictForSegments_(
+  events,
+  personName,
+  incomingSegments,
+  cedingSegments
+) {
+  for (const event of events) {
+    if (
+      titleInfo_(event.getTitle()).name !== personName
+    ) {
+      continue;
+    }
+
+    const eventStart = +event.getStartTime();
+    const eventEnd = +event.getEndTime();
+
+    for (const incoming of incomingSegments) {
+      const os = Math.max(incoming.s, eventStart);
+      const oe = Math.min(incoming.e, eventEnd);
+
+      if (os >= oe) continue;
+
+      if (
+        intervalCoveredByCeding_(
+          event,
+          os,
+          oe,
+          cedingSegments
+        )
+      ) {
+        continue;
+      }
+
+      return event;
+    }
+  }
+
+  return null;
+}
+
 
 function analyzeRequest(sheet, calendar, r) {
-  const req = readRequest_(
-    sheet,
-    r
-  );
+  const req = readRequest_(sheet, r);
 
   const reject = (code, message) => ({
     ok: false,
@@ -878,10 +960,7 @@ function analyzeRequest(sheet, calendar, r) {
     );
   }
 
-  if (
-    !hasTarget &&
-    anySwap
-  ) {
+  if (!hasTarget && anySwap) {
     return reject(
       "LEAVE_FIELDS",
       "純請假的 G/H/I 請全部留白。"
@@ -935,74 +1014,33 @@ function analyzeRequest(sheet, calendar, r) {
     );
   }
 
-  const findPerson = (
-    events,
-    name,
-    start,
-    end
-  ) => events.filter(event =>
-    titleInfo_(
-      event.getTitle()
-    ).name === name &&
-    overlap_(
-      +start,
-      +end,
-      +event.getStartTime(),
-      +event.getEndTime()
-    )
-  );
-
   const originalEvents = calendar.getEvents(
     originalStart,
     originalEnd
   );
 
-  const originalMatches = findPerson(
+  const originalResult = buildSegments_(
     originalEvents,
     req.person,
     originalStart,
-    originalEnd
+    originalEnd,
+    "原值班行程"
   );
 
-  if (originalMatches.length !== 1) {
+  if (!originalResult.ok) {
     return reject(
       "ORIGINAL",
-      originalMatches.length
-        ? req.person + " 同時段有多筆行程，請管理員確認。"
-        : "找不到 " + req.person + " 的原值班行程。"
+      originalResult.message
     );
   }
 
-  const contained = (
-    event,
-    start,
-    end
-  ) => (
-    !event.isAllDayEvent() &&
-    +start >= +event.getStartTime() &&
-    +end <= +event.getEndTime()
-  );
-
-  const originalEvent = originalMatches[0];
-
-  if (
-    !contained(
-      originalEvent,
-      originalStart,
-      originalEnd
-    )
-  ) {
-    return reject(
-      "RANGE",
-      "申請時段超出原班，或原班是全天事件。"
-    );
-  }
+  const origSegments = originalResult.segments;
 
   const type = hasTarget
     ? (allSwap ? "swap" : "sub")
     : "leave";
 
-  let swapEvent = null;
+  let swapSegments = [];
 
   if (type === "swap") {
     const targetEvents = calendar.getEvents(
@@ -1010,177 +1048,108 @@ function analyzeRequest(sheet, calendar, r) {
       swapEnd
     );
 
-    const targetMatches = findPerson(
+    const targetResult = buildSegments_(
       targetEvents,
       req.target,
-      swapStart,
-      swapEnd
-    );
-
-    if (targetMatches.length !== 1) {
-      return reject(
-        "TARGET",
-        "配合人互換時段的班表不存在或不唯一。"
-      );
-    }
-
-    swapEvent = targetMatches[0];
-
-    if (
-      !contained(
-        swapEvent,
-        swapStart,
-        swapEnd
-      )
-    ) {
-      return reject(
-        "TARGET_RANGE",
-        "互換時段超出配合人原班。"
-      );
-    }
-
-    const targetConflict = hasConflict_(
-      originalEvents,
-      req.target,
-      originalStart,
-      originalEnd,
-      swapEvent,
-      swapStart,
-      swapEnd
-    );
-
-    const originalConflict = hasConflict_(
-      targetEvents,
-      req.person,
       swapStart,
       swapEnd,
-      originalEvent,
-      originalStart,
-      originalEnd
+      "互換時段行程"
     );
 
-    if (
-      targetConflict ||
-      originalConflict
-    ) {
+    if (!targetResult.ok) {
       return reject(
-        "CONFLICT_SWAP",
-        "雙向換班後與既有值班／請假紀錄或殘餘時段衝突。"
+        "TARGET",
+        targetResult.message
       );
     }
 
-  } else if (
-    hasTarget &&
-    hasConflict_(
+    swapSegments = targetResult.segments;
+
+    const targetConflict = findConflictForSegments_(
       originalEvents,
       req.target,
-      originalStart,
-      originalEnd,
-      null,
-      null,
-      null
-    )
-  ) {
-    return reject(
-      "CONFLICT_SUB",
-      req.target + " 在代班時段已有值班／請假紀錄。"
+      origSegments,
+      swapSegments
     );
+
+    if (targetConflict) {
+      return reject(
+        "CONFLICT_SWAP_TARGET",
+        `${req.target} 在換到的原值班實際時段已有班 ` +
+        `(${targetConflict.getTitle()} ` +
+        `${formatEventTime_(targetConflict)})。`
+      );
+    }
+
+    const originalConflict = findConflictForSegments_(
+      targetEvents,
+      req.person,
+      swapSegments,
+      origSegments
+    );
+
+    if (originalConflict) {
+      return reject(
+        "CONFLICT_SWAP_ORIGINAL",
+        `${req.person} 在換到的互換實際時段已有班 ` +
+        `(${originalConflict.getTitle()} ` +
+        `${formatEventTime_(originalConflict)})。`
+      );
+    }
+
+  } else if (hasTarget) {
+    const conflict = findConflictForSegments_(
+      originalEvents,
+      req.target,
+      origSegments,
+      []
+    );
+
+    if (conflict) {
+      return reject(
+        "CONFLICT_SUB",
+        `${req.target} 在實際代班時段已有值班／請假紀錄 ` +
+        `(${conflict.getTitle()} ${formatEventTime_(conflict)})。`
+      );
+    }
   }
+
+  const origStates = origSegments.map(segment =>
+    titleInfo_(segment.event.getTitle()).state
+  );
 
   return {
     ok: true,
     req: req,
     type: type,
-    orig: originalEvent,
-    swap: swapEvent,
 
-    os: +originalStart,
-    oe: +originalEnd,
-
-    ss: swapStart
-      ? +swapStart
-      : null,
-
-    se: swapEnd
-      ? +swapEnd
-      : null,
+    origSegments: origSegments,
+    swapSegments: swapSegments,
 
     late:
       type === "sub" &&
-      titleInfo_(
-        originalEvent.getTitle()
-      ).state === "請假"
+      origStates.length > 0 &&
+      origStates.every(state => state === "請假")
   };
 }
 
 
-function hasConflict_(
-  events,
-  name,
-  start,
-  end,
-  cedingEvent,
-  cededStart,
-  cededEnd
-) {
-  return events.some(event => {
-    if (
-      titleInfo_(
-        event.getTitle()
-      ).name !== name
-    ) {
-      return false;
-    }
-
-    const eventStart = +event.getStartTime();
-    const eventEnd = +event.getEndTime();
-
-    // 重複行程的 iCalUID 可能相同，
-    // 所以還要比對該次行程的開始／結束時間。
-    const sameEvent = (
-      cedingEvent &&
-      event.getId() === cedingEvent.getId() &&
-      eventStart === +cedingEvent.getStartTime() &&
-      eventEnd === +cedingEvent.getEndTime()
-    );
-
-    if (!sameEvent) {
-      return overlap_(
-        +start,
-        +end,
-        eventStart,
-        eventEnd
-      );
-    }
-
-    const frontConflict = (
-      eventStart < +cededStart &&
-      overlap_(
-        +start,
-        +end,
-        eventStart,
-        +cededStart
-      )
-    );
-
-    const backConflict = (
-      +cededEnd < eventEnd &&
-      overlap_(
-        +start,
-        +end,
-        +cededEnd,
-        eventEnd
-      )
-    );
-
-    return frontConflict || backConflict;
-  });
+function formatEventTime_(event) {
+  return (
+    Utilities.formatDate(
+      event.getStartTime(),
+      CONFIG.TIME_ZONE,
+      "HH:mm"
+    ) +
+    "-" +
+    Utilities.formatDate(
+      event.getEndTime(),
+      CONFIG.TIME_ZONE,
+      "HH:mm"
+    )
+  );
 }
 
-
-// ============================================================
-// 中繼資料、快照與修改計畫
-// ============================================================
 
 function enc_(text) {
   return Utilities.base64EncodeWebSafe(
@@ -1213,8 +1182,6 @@ function meta_(description, key) {
 }
 
 
-// 找出目前事件依賴的前序申請。
-// 同時讀取 v6.2 的 Base64 快照鏈。
 function owners_(description, depth) {
   depth = depth || 0;
 
@@ -1239,11 +1206,20 @@ function owners_(description, depth) {
   );
 
   if (parents) {
-    result.push(
-      ...JSON.parse(
+    try {
+      const decoded = JSON.parse(
         dec_(parents)
-      )
-    );
+      );
+
+      if (Array.isArray(decoded)) {
+        result.push(...decoded);
+      }
+
+    } catch (_) {
+      throw new Error(
+        "舊版 ANCESTORS_B64 無法解析，請人工核對。"
+      );
+    }
   }
 
   const previous = meta_(
@@ -1264,8 +1240,10 @@ function owners_(description, depth) {
 }
 
 
-function humanDesc_(description) {
-  return String(description || "")
+function visibleDesc_(description) {
+  let result = String(
+    description || ""
+  )
     .replace(
       /^\[(?:ROW_ID|ANCESTORS_B64|PART_ID|ORIG_TITLE_B64|ORIG_DESC_B64|SPLIT_ORIG_TIME):[^\]\r\n]*\]\r?\n?/gm,
       ""
@@ -1274,39 +1252,176 @@ function humanDesc_(description) {
       /^\[AUTO_SPLIT_CREATED\]\r?\n?/gm,
       ""
     )
+    .replace(
+      /^[ \t]*-[ \t]*申請[ \t]*ID[：:][^\r\n]*(?:\r?\n|$)/gmi,
+      ""
+    )
     .trim();
+
+  result = result
+    .replace(
+      /\r?\n?-{10,}[ \t]*$/g,
+      ""
+    )
+    .replace(
+      /\n{3,}/g,
+      "\n\n"
+    )
+    .trim();
+
+  return result;
+}
+
+
+function humanDesc_(description) {
+  return visibleDesc_(description);
+}
+
+
+function composeDesc_(detail, previousHuman) {
+  const detailText = visibleDesc_(detail);
+  const previousText = visibleDesc_(previousHuman);
+
+  if (detailText && previousText) {
+    return (
+      detailText +
+      "\n--------------------\n" +
+      previousText
+    ).trim();
+  }
+
+  return (detailText || previousText).trim();
+}
+
+
+function legacyMetaFromDesc_(description) {
+  const desc = String(
+    description || ""
+  );
+
+  return {
+    rowId: meta_(desc, "ROW_ID") || "",
+    partId: meta_(desc, "PART_ID") || "",
+    splitChild:
+      /^\[AUTO_SPLIT_CREATED\]\s*$/m.test(desc),
+    legacyOwners: owners_(desc)
+  };
+}
+
+
+function eventMeta_(event) {
+  const legacy = legacyMetaFromDesc_(
+    event.getDescription() || ""
+  );
+
+  const tagRow =
+    event.getTag(EVENT_TAGS.ROW_ID);
+
+  const tagPart =
+    event.getTag(EVENT_TAGS.PART_ID);
+
+  return {
+    rowId: text_(tagRow) || legacy.rowId,
+    partId: text_(tagPart) || legacy.partId,
+    splitChild:
+      Boolean(text_(tagPart)) ||
+      legacy.splitChild,
+    legacyOwners: legacy.legacyOwners
+  };
+}
+
+
+function normalizeSnapshot_(snapshot) {
+  const result = clone_(
+    snapshot || {}
+  );
+
+  const legacy = legacyMetaFromDesc_(
+    result.desc || ""
+  );
+
+  const explicit = result.meta || {};
+
+  result.desc = visibleDesc_(
+    result.desc || ""
+  );
+
+  result.meta = {
+    rowId:
+      text_(explicit.rowId) ||
+      legacy.rowId,
+
+    partId:
+      text_(explicit.partId) ||
+      legacy.partId,
+
+    splitChild:
+      Boolean(explicit.splitChild) ||
+      Boolean(text_(explicit.partId)) ||
+      legacy.splitChild
+  };
+
+  return result;
 }
 
 
 function snap_(event) {
-  return {
+  return normalizeSnapshot_({
     id: event.getId(),
     s: +event.getStartTime(),
     e: +event.getEndTime(),
     title: event.getTitle(),
     desc: event.getDescription() || "",
-    location: event.getLocation() || ""
-  };
+    location: event.getLocation() || "",
+    meta: eventMeta_(event)
+  });
+}
+
+
+function sameMeta_(a, b) {
+  a = a || {};
+  b = b || {};
+
+  return (
+    text_(a.rowId) === text_(b.rowId) &&
+    text_(a.partId) === text_(b.partId) &&
+    Boolean(a.splitChild) ===
+      Boolean(b.splitChild)
+  );
 }
 
 
 function same_(a, b) {
+  a = normalizeSnapshot_(a);
+  b = normalizeSnapshot_(b);
+
   return (
     a.s === b.s &&
     a.e === b.e &&
     a.title === b.title &&
     a.desc === b.desc &&
-    a.location === b.location
+    a.location === b.location &&
+    sameMeta_(a.meta, b.meta)
   );
 }
 
 
-// 中途 setter 失敗時，各欄位可能停在修改前或修改後。
-// 只允許本次修改可解釋的組合，避免覆寫外部手動修改。
 function compatible_(current, before, after) {
+  current = normalizeSnapshot_(current);
+  before = normalizeSnapshot_(before);
+  after = normalizeSnapshot_(after);
+
+  const metaOkay =
+    sameMeta_(current.meta, before.meta) ||
+    sameMeta_(current.meta, after.meta);
+
   return (
-    [before.title, after.title].includes(current.title) &&
-    [before.desc, after.desc].includes(current.desc) &&
+    [before.title, after.title]
+      .includes(current.title) &&
+
+    [before.desc, after.desc]
+      .includes(current.desc) &&
+
     (
       (
         current.s === before.s &&
@@ -1317,31 +1432,89 @@ function compatible_(current, before, after) {
         current.e === after.e
       )
     ) &&
-    current.location === before.location
+
+    current.location === before.location &&
+    metaOkay
+  );
+}
+
+
+function applyEventMeta_(event, meta) {
+  meta = meta || {};
+
+  const setOrDelete = (
+    key,
+    value
+  ) => {
+    const wanted = text_(value);
+    const current = event.getTag(key);
+
+    if (wanted) {
+      if (current !== wanted) {
+        event.setTag(
+          key,
+          wanted
+        );
+      }
+
+    } else if (current !== null) {
+      event.deleteTag(key);
+    }
+  };
+
+  setOrDelete(
+    EVENT_TAGS.ROW_ID,
+    meta.rowId
+  );
+
+  setOrDelete(
+    EVENT_TAGS.PART_ID,
+    meta.partId
+  );
+
+  setOrDelete(
+    EVENT_TAGS.VERSION,
+    meta.rowId
+      ? CONFIG.VERSION
+      : ""
   );
 }
 
 
 function putSnapshot_(event, target) {
+  const normalized =
+    normalizeSnapshot_(target);
+
   if (
-    +event.getStartTime() !== target.s ||
-    +event.getEndTime() !== target.e
+    +event.getStartTime() !== normalized.s ||
+    +event.getEndTime() !== normalized.e
   ) {
     event.setTime(
-      new Date(target.s),
-      new Date(target.e)
+      new Date(normalized.s),
+      new Date(normalized.e)
     );
   }
 
-  if (event.getTitle() !== target.title) {
-    event.setTitle(target.title);
+  if (
+    event.getTitle() !== normalized.title
+  ) {
+    event.setTitle(
+      normalized.title
+    );
   }
 
-  // 說明最後寫，保留控制標記直到其他屬性完成。
+  applyEventMeta_(
+    event,
+    normalized.meta
+  );
+
   if (
-    (event.getDescription() || "") !== target.desc
+    (event.getDescription() || "") !==
+    normalized.desc
   ) {
-    event.setDescription(target.desc);
+    event.setDescription(
+      normalized.desc
+    );
   }
 }
 
@@ -1358,16 +1531,26 @@ function plan_(
   const before = snap_(event);
   const after = clone_(before);
 
-  const ancestry = owners_(before.desc);
+  const parentTokens =
+    before.meta &&
+    before.meta.rowId
+      ? [before.meta.rowId]
+      : [];
 
-  const header =
-    `[ROW_ID:${token}]\n` +
-    `[ANCESTORS_B64:${enc_(JSON.stringify(ancestry))}]`;
-
-  const human = humanDesc_(before.desc);
+  const human = before.desc;
 
   const title =
     `${worker}${titleInfo_(before.title).floor} [${tag}]`;
+
+  const currentMeta = {
+    rowId: token,
+    partId: "",
+    splitChild: false
+  };
+
+  after.meta = clone_(
+    currentMeta
+  );
 
   const additions = [];
 
@@ -1378,7 +1561,8 @@ function plan_(
     body
   ) => {
     const key =
-      token + ":" + (additions.length + 1);
+      token + ":" +
+      (additions.length + 1);
 
     additions.push({
       key: key,
@@ -1390,41 +1574,30 @@ function plan_(
         e: partEnd,
         title: partTitle,
         location: before.location,
+        desc: visibleDesc_(body),
 
-        desc:
-          `[AUTO_SPLIT_CREATED]\n` +
-          `${header}\n` +
-          `[PART_ID:${key}]\n` +
-          body
+        meta: {
+          rowId: token,
+          partId: key,
+          splitChild: true
+        }
       }
     });
-
-    additions[
-      additions.length - 1
-    ].want.desc = additions[
-      additions.length - 1
-    ].want.desc.trim();
   };
 
-  // 整段異動
   if (
     start === before.s &&
     end === before.e
   ) {
     after.title = title;
-
-    after.desc =
-      `${header}\n` +
-      `${detail}\n` +
-      `--------------------\n` +
-      human;
-
-    after.desc = after.desc.trim();
+    after.desc = composeDesc_(
+      detail,
+      human
+    );
 
   } else {
-    after.desc = `${header}\n${human}`.trim();
+    after.desc = human;
 
-    // 切中間或後半
     if (start > before.s) {
       after.e = start;
 
@@ -1432,7 +1605,10 @@ function plan_(
         start,
         end,
         title,
-        detail + "\n" + human
+        composeDesc_(
+          detail,
+          human
+        )
       );
 
       if (end < before.e) {
@@ -1445,20 +1621,23 @@ function plan_(
       }
 
     } else {
-      // 切前半
       after.s = end;
 
       add(
         start,
         end,
         title,
-        detail + "\n" + human
+        composeDesc_(
+          detail,
+          human
+        )
       );
     }
   }
 
   return {
     token: token,
+    parentTokens: parentTokens,
     before: before,
     after: after,
     additions: additions,
@@ -1484,7 +1663,6 @@ function appliedText_(st) {
 
 function newTransaction_(c, calendar, analysis) {
   const tx = Utilities.getUuid();
-
   const base = c.id + "-" + tx;
 
   const tag =
@@ -1499,38 +1677,42 @@ function newTransaction_(c, calendar, analysis) {
       ? analysis.req.person
       : analysis.req.target;
 
-  const plans = [
-    plan_(
-      analysis.orig,
-      analysis.os,
-      analysis.oe,
-      firstWorker,
-      tag,
-      base + "-A",
+  const plans = [];
 
-      `【${tag}紀錄】\n` +
-      `- 原定值班：${analysis.req.person}\n` +
-      `- 實際安排：${firstWorker}\n` +
-      `- 申請 ID：${c.id}`
-    )
-  ];
-
-  if (analysis.type === "swap") {
+  analysis.origSegments.forEach((segment, index) => {
     plans.push(
       plan_(
-        analysis.swap,
-        analysis.ss,
-        analysis.se,
-        analysis.req.person,
+        segment.event,
+        segment.s,
+        segment.e,
+        firstWorker,
         tag,
-        base + "-B",
+        `${base}-A${index + 1}`,
 
-        `【換班紀錄】\n` +
-        `- 原定值班：${analysis.req.target}\n` +
-        `- 實際到勤：${analysis.req.person}\n` +
-        `- 申請 ID：${c.id}`
+        `【${tag}紀錄】\n` +
+        `- 原定值班：${analysis.req.person}\n` +
+        `- 實際安排：${firstWorker}`
       )
     );
+  });
+
+  if (analysis.type === "swap") {
+    analysis.swapSegments.forEach((segment, index) => {
+      plans.push(
+        plan_(
+          segment.event,
+          segment.s,
+          segment.e,
+          analysis.req.person,
+          tag,
+          `${base}-B${index + 1}`,
+
+          `【換班紀錄】\n` +
+          `- 原定值班：${analysis.req.target}\n` +
+          `- 實際到勤：${analysis.req.person}`
+        )
+      );
+    });
   }
 
   return {
@@ -1556,10 +1738,6 @@ function newTransaction_(c, calendar, analysis) {
   };
 }
 
-
-// ============================================================
-// 正式異動與失敗補償
-// ============================================================
 
 function processSingleRow_(c, calendar) {
   let st = state_(c);
@@ -1590,7 +1768,6 @@ function processSingleRow_(c, calendar) {
     ).getValue()
   );
 
-  // 已執行的舊版案件：只有取消時才嘗試安全匯入。
   if (
     !st &&
     oldStatus.startsWith("已更新日曆")
@@ -1613,7 +1790,6 @@ function processSingleRow_(c, calendar) {
     }
   }
 
-  // 已執行成功
   if (
     st &&
     st.phase === ACTIVE_PHASE
@@ -1627,7 +1803,6 @@ function processSingleRow_(c, calendar) {
       return;
     }
 
-    // 取消 L：先完整檢查，通過才做任何刪除／還原。
     try {
       const events = eventsForTx_(
         calendar,
@@ -1635,6 +1810,7 @@ function processSingleRow_(c, calendar) {
       );
 
       preflightUndo_(
+        c,
         st,
         events
       );
@@ -1695,7 +1871,6 @@ function processSingleRow_(c, calendar) {
 
   if (!checked) return;
 
-  // 已成功後又取消的案件，不重用原列。
   if (
     st &&
     st.phase === "UNDONE"
@@ -1732,15 +1907,14 @@ function processSingleRow_(c, calendar) {
     analysis
   );
 
-  // 必須先成功保存快照，才開始改 Calendar。
   saveState_(
     c,
     st
   );
 
   const references = [
-    analysis.orig,
-    analysis.swap
+    ...analysis.origSegments.map(segment => segment.event),
+    ...analysis.swapSegments.map(segment => segment.event)
   ];
 
   try {
@@ -1797,8 +1971,6 @@ function processSingleRow_(c, calendar) {
           );
 
         } catch (err) {
-          // 明確被拒絕的呼叫，沒有建立事件。
-          // 其他錯誤保留 CREATING，等待核對。
           const definitelyRejected =
             /permission|authorization|quota|too many times|invalid (argument|date|time)/i
               .test(err.message);
@@ -1816,6 +1988,18 @@ function processSingleRow_(c, calendar) {
         }
 
         addition.id = created.getId();
+        addition.stage = "CREATED_UNTAGGED";
+
+        saveState_(
+          c,
+          st
+        );
+
+        putSnapshot_(
+          created,
+          addition.want
+        );
+
         addition.stage = "CREATED";
 
         saveState_(
@@ -1877,10 +2061,6 @@ function processSingleRow_(c, calendar) {
 }
 
 
-// ============================================================
-// 還原前檢查與復原
-// ============================================================
-
 function eventsForTx_(calendar, st) {
   if (calendar.getId() !== st.calendar) {
     throw new Error(
@@ -1910,17 +2090,17 @@ function eventsForTx_(calendar, st) {
 
 
 function mainEvent_(p, events) {
+  const before = normalizeSnapshot_(p.before);
+  const after = normalizeSnapshot_(p.after);
+
   const candidates = events.filter(event =>
-    event.getId() === p.before.id &&
+    event.getId() === before.id &&
     (
       (
-        +event.getStartTime() === p.before.s ||
-        +event.getStartTime() === p.after.s
+        +event.getStartTime() === before.s ||
+        +event.getStartTime() === after.s
       ) ||
-      meta_(
-        event.getDescription(),
-        "ROW_ID"
-      ) === p.token
+      eventMeta_(event).rowId === p.token
     )
   );
 
@@ -1935,15 +2115,16 @@ function mainEvent_(p, events) {
 
 
 function addedEvent_(addition, events) {
+  const wanted = normalizeSnapshot_(
+    addition.want
+  );
+
   const candidates = events.filter(event =>
-    meta_(
-      event.getDescription(),
-      "PART_ID"
-    ) === addition.key ||
+    eventMeta_(event).partId === addition.key ||
     (
       addition.id &&
       event.getId() === addition.id &&
-      +event.getStartTime() === addition.want.s
+      +event.getStartTime() === wanted.s
     )
   );
 
@@ -1957,23 +2138,101 @@ function addedEvent_(addition, events) {
 }
 
 
-// 有後續依賴時，不允許先取消原申請。
-function checkDependents_(tokens, events) {
-  for (const event of events) {
-    const description =
-      event.getDescription() || "";
+function planParentTokens_(plan) {
+  if (
+    Array.isArray(plan.parentTokens) &&
+    plan.parentTokens.length
+  ) {
+    return [
+      ...new Set(
+        plan.parentTokens
+          .map(text_)
+          .filter(Boolean)
+      )
+    ];
+  }
 
-    const top = meta_(
-      description,
-      "ROW_ID"
-    );
+  const before = normalizeSnapshot_(
+    plan.before
+  );
+
+  return before.meta &&
+    before.meta.rowId
+      ? [before.meta.rowId]
+      : [];
+}
+
+
+function checkDependents_(c, tokens, events) {
+  const lastRow = c.s.getLastRow();
+
+  if (lastRow >= 2) {
+    const notes = c.s.getRange(
+      2,
+      CONFIG.REQUEST_ID_COL,
+      lastRow - 1,
+      1
+    ).getNotes();
+
+    notes.forEach((entry, index) => {
+      if (!entry[0]) return;
+
+      let other;
+
+      try {
+        other = JSON.parse(
+          entry[0]
+        );
+
+      } catch (_) {
+        throw new Error(
+          "第 " +
+          (index + 2) +
+          " 列 Q 註解異常，請先核對。"
+        );
+      }
+
+      if (
+        !other ||
+        other.kind !== "shift-tx" ||
+        other.id === c.id ||
+        !(
+          other.phase === ACTIVE_PHASE ||
+          OPEN_PHASES.includes(other.phase)
+        )
+      ) {
+        return;
+      }
+
+      const dependent =
+        (other.plans || []).some(plan =>
+          planParentTokens_(plan)
+            .some(parent =>
+              tokens.includes(parent)
+            )
+        );
+
+      if (dependent) {
+        throw new Error(
+          "第 " +
+          (index + 2) +
+          " 列仍依賴這筆班表異動，請先取消後補代班／後續異動。"
+        );
+      }
+    });
+  }
+
+  for (const event of events) {
+    const raw = event.getDescription() || "";
+    const top = eventMeta_(event).rowId;
 
     if (
       top &&
       !tokens.includes(top) &&
-      owners_(
-        description
-      ).some(token => tokens.includes(token))
+      owners_(raw)
+        .some(token =>
+          tokens.includes(token)
+        )
     ) {
       throw new Error(
         "仍有後補代班／後續異動「" +
@@ -1985,7 +2244,6 @@ function checkDependents_(tokens, events) {
 }
 
 
-// 還原也要避免與後來新增的其他班表撞班。
 function checkRestoreConflicts_(st, events) {
   const tokens = st.plans.map(
     p => p.token
@@ -1994,36 +2252,53 @@ function checkRestoreConflicts_(st, events) {
   const outside = events.filter(event => {
     if (
       tokens.includes(
-        meta_(
-          event.getDescription(),
-          "ROW_ID"
-        )
+        eventMeta_(event).rowId
       )
     ) {
       return false;
     }
 
-    return !st.plans.some(p =>
-      (
-        event.getId() === p.before.id &&
-        [
-          +p.before.s,
-          +p.after.s
-        ].includes(
-          +event.getStartTime()
-        )
-      ) ||
-      p.additions.some(addition =>
-        addition.id &&
-        event.getId() === addition.id &&
-        +event.getStartTime() === addition.want.s
-      )
-    );
+    return !st.plans.some(p => {
+      const before = normalizeSnapshot_(
+        p.before
+      );
+
+      const after = normalizeSnapshot_(
+        p.after
+      );
+
+      return (
+        (
+          event.getId() === before.id &&
+          [
+            +before.s,
+            +after.s
+          ].includes(
+            +event.getStartTime()
+          )
+        ) ||
+        p.additions.some(addition => {
+          const wanted = normalizeSnapshot_(
+            addition.want
+          );
+
+          return (
+            addition.id &&
+            event.getId() === addition.id &&
+            +event.getStartTime() === wanted.s
+          );
+        })
+      );
+    });
   });
 
   for (const p of st.plans) {
+    const before = normalizeSnapshot_(
+      p.before
+    );
+
     const name = titleInfo_(
-      p.before.title
+      before.title
     ).name;
 
     const conflict = outside.some(event =>
@@ -2031,8 +2306,8 @@ function checkRestoreConflicts_(st, events) {
         event.getTitle()
       ).name === name &&
       overlap_(
-        p.before.s,
-        p.before.e,
+        before.s,
+        before.e,
         +event.getStartTime(),
         +event.getEndTime()
       )
@@ -2049,9 +2324,9 @@ function checkRestoreConflicts_(st, events) {
 }
 
 
-// 確認本次異動目前仍完整存在，未被後續操作改掉。
-function assertAppliedIntact_(st, events) {
+function assertAppliedIntact_(c, st, events) {
   checkDependents_(
+    c,
     st.plans.map(p => p.token),
     events
   );
@@ -2092,8 +2367,9 @@ function assertAppliedIntact_(st, events) {
 }
 
 
-function preflightUndo_(st, events) {
+function preflightUndo_(c, st, events) {
   assertAppliedIntact_(
+    c,
     st,
     events
   );
@@ -2113,6 +2389,7 @@ function restoreTransaction_(
   confirmed
 ) {
   checkDependents_(
+    c,
     st.plans.map(p => p.token),
     events
   );
@@ -2124,7 +2401,6 @@ function restoreTransaction_(
 
   const errors = [];
 
-  // 雙向換班從後處理的一邊開始復原。
   for (const p of [...st.plans].reverse()) {
     if (
       !p.touched ||
@@ -2151,7 +2427,6 @@ function restoreTransaction_(
         );
       }
 
-      // 先刪衍生事件，再恢復主事件。
       for (
         const addition of [...p.additions].reverse()
       ) {
@@ -2169,7 +2444,10 @@ function restoreTransaction_(
 
         if (!event) {
           if (
-            addition.stage === "CREATING" &&
+            (
+              addition.stage === "CREATING" ||
+              addition.stage === "CREATED_UNTAGGED"
+            ) &&
             !addition.id &&
             !confirmed
           ) {
@@ -2199,8 +2477,6 @@ function restoreTransaction_(
 
           event.deleteEvent();
 
-          // 從同一批清單移除，
-          // 後續不再讀取或修改已刪除物件。
           events.splice(
             events.indexOf(event),
             1
@@ -2319,13 +2595,6 @@ function markRecovery_(c, st, err) {
 }
 
 
-// ============================================================
-// 舊 v6.2 案件安全匯入
-//
-// 必須有完整快照，才允許自動還原。
-// 沒有快照或沒有 UUID，就不猜測。
-// ============================================================
-
 function adoptLegacy_(c, calendar) {
   const req = readRequest_(
     c.s,
@@ -2388,22 +2657,18 @@ function adoptLegacy_(c, calendar) {
   );
 
   checkDependents_(
+    c,
     windows.map(w => w.token),
     events
   );
 
   const plans = windows.map(w => {
     const group = events.filter(event =>
-      meta_(
-        event.getDescription(),
-        "ROW_ID"
-      ) === w.token
+      eventMeta_(event).rowId === w.token
     );
 
     const mainEvents = group.filter(event =>
-      !/^\[AUTO_SPLIT_CREATED\]\s*$/m.test(
-        event.getDescription()
-      )
+      !eventMeta_(event).splitChild
     );
 
     if (mainEvents.length !== 1) {
@@ -2412,17 +2677,17 @@ function adoptLegacy_(c, calendar) {
       );
     }
 
-    const after = snap_(
-      mainEvents[0]
-    );
+    const main = mainEvents[0];
+    const rawDescription =
+      main.getDescription() || "";
 
     const originalTitle = meta_(
-      after.desc,
+      rawDescription,
       "ORIG_TITLE_B64"
     );
 
     const originalDescription = meta_(
-      after.desc,
+      rawDescription,
       "ORIG_DESC_B64"
     );
 
@@ -2435,7 +2700,8 @@ function adoptLegacy_(c, calendar) {
       );
     }
 
-    const before = clone_(after);
+    const after = snap_(main);
+    let before = clone_(after);
 
     before.title = dec_(
       originalTitle
@@ -2446,7 +2712,7 @@ function adoptLegacy_(c, calendar) {
     );
 
     const split = meta_(
-      after.desc,
+      rawDescription,
       "SPLIT_ORIG_TIME"
     );
 
@@ -2458,6 +2724,10 @@ function adoptLegacy_(c, calendar) {
       before.s = parts[0];
       before.e = parts[1];
     }
+
+    before = normalizeSnapshot_(
+      before
+    );
 
     if (
       titleInfo_(before.title).name !== w.person ||
@@ -2482,7 +2752,7 @@ function adoptLegacy_(c, calendar) {
     }
 
     const additions = group
-      .filter(event => event !== mainEvents[0])
+      .filter(event => event !== main)
       .map((event, index) => ({
         key: w.token + ":legacy:" + index,
         id: event.getId(),
@@ -2492,6 +2762,11 @@ function adoptLegacy_(c, calendar) {
 
     return {
       token: w.token,
+      parentTokens:
+        before.meta &&
+        before.meta.rowId
+          ? [before.meta.rowId]
+          : [],
       before: before,
       after: after,
       additions: additions,
@@ -2539,10 +2814,6 @@ function adoptLegacy_(c, calendar) {
   return st;
 }
 
-
-// ============================================================
-// Email 設定與收件人檢查
-// ============================================================
 
 function validEmail_(email) {
   return /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/
@@ -2637,10 +2908,6 @@ function staffEmail_(sheet, name) {
 }
 
 
-// ============================================================
-// 通知紀錄
-// ============================================================
-
 function noticeStore_(c, col) {
   const store = readNote_(
     cell_(c, col),
@@ -2695,10 +2962,6 @@ function task_(
   };
 }
 
-
-// ============================================================
-// 核准通知
-// ============================================================
 
 function approval_(c, deadline) {
   assertNoPending_(
@@ -2765,10 +3028,10 @@ function approval_(c, deadline) {
     );
   }
 
-  // 防止後續班表已經改動，卻補寄過期核准內容。
   if (st) {
     try {
       assertAppliedIntact_(
+        c,
         st,
         eventsForTx_(
           getCalendar_(),
@@ -2804,7 +3067,6 @@ function approval_(c, deadline) {
     cell_(c, col).getValue()
   );
 
-  // 舊版已有完整成功紀錄：不再重寄。
   if (
     !st &&
     !store.latest &&
@@ -2891,8 +3153,6 @@ function approval_(c, deadline) {
       );
     }
 
-    // 舊版只記「失敗」時，可能第一封其實已寄出。
-    // 不猜測哪位收件人收到，先要求人工核對。
     if (
       !st &&
       /失敗/.test(legacyText)
@@ -2929,10 +3189,6 @@ function approval_(c, deadline) {
 }
 
 
-// ============================================================
-// 系統檢核退件
-// ============================================================
-
 function reject_(c, analysis, stage) {
   cell_(
     c,
@@ -2958,8 +3214,6 @@ function reject_(c, analysis, stage) {
     col
   );
 
-  // 不把預檢／正式審核前綴放進識別碼。
-  // 同一筆資料、同一理由不會只因階段不同而重寄。
   const key = hash_([
     analysis.req,
     analysis.code,
@@ -3008,16 +3262,6 @@ function reject_(c, analysis, stage) {
 }
 
 
-// ============================================================
-// 逐封寄送
-//
-// READY：尚未寄
-// SENDING：開始交寄，但未寫入完成紀錄
-// SENT：API 回傳成功並完成紀錄
-// FAILED：明確未完成，可以重試
-// UNKNOWN：結果不明，必須先人工核對
-// ============================================================
-
 function sendBatch_(
   c,
   col,
@@ -3036,7 +3280,6 @@ function sendBatch_(
 
     if (task.status === "SENT") continue;
 
-    // 上次可能在寄出後中斷，不能直接重寄。
     if (task.status === "SENDING") {
       task.status = "UNKNOWN";
 
@@ -3088,7 +3331,6 @@ function sendBatch_(
       task.status = "SENDING";
       task.error = "";
 
-      // 先保存交寄中狀態，再呼叫 MailApp。
       saveMail_(
         c,
         col,
@@ -3114,8 +3356,6 @@ function sendBatch_(
         MailApp.sendEmail(message);
 
       } catch (err) {
-        // 明確的授權／額度／收件地址拒絕才直接允許重試。
-        // 一般連線錯誤視為結果不明。
         const definitelyNotSent =
           /permission|authorization|required permissions|quota|too many times|invalid.*(email|recipient)|無權限|授權|額度/i
             .test(err.message);
@@ -3138,7 +3378,6 @@ function sendBatch_(
       task.status = "SENT";
       task.at = now_();
 
-      // 每一封立即記錄，不等另一位收件人寄完。
       saveMail_(
         c,
         col,
@@ -3146,7 +3385,6 @@ function sendBatch_(
       );
 
     } catch (err) {
-      // API 成功但寫入紀錄失敗，也不能當成未寄。
       if (
         task.status === "SENDING" ||
         task.status === "SENT"
@@ -3219,10 +3457,6 @@ function sendBatch_(
 }
 
 
-// ============================================================
-// 人工工具：選取一列後操作，不必修改程式或刪除紀錄
-// ============================================================
-
 function selected_() {
   const sheet = SpreadsheetApp
     .getActiveSpreadsheet()
@@ -3249,10 +3483,6 @@ function selected_() {
   );
 }
 
-
-// ============================================================
-// 重試尚未完成的通知
-// ============================================================
 
 function retrySelectedNotifications() {
   locked_(() => {
@@ -3339,15 +3569,6 @@ function retrySelectedNotifications() {
 }
 
 
-// ============================================================
-// 人工核對不明寄信結果
-//
-// 必須先實際確認收件人信箱／管理員副本。
-// 「是」：確認已寄，標記完成
-// 「否」：確認未寄，允許下次重試
-// 「取消」：仍不確定，不改狀態
-// ============================================================
-
 function resolveSelectedMail() {
   const c = locked_(
     () => selected_()
@@ -3388,7 +3609,6 @@ function resolveSelectedMail() {
 
         const task = tasks[index];
 
-        // UI 等候期間不占用 Script Lock。
         const answer = ui.alert(
           "先核對信箱／管理員副本",
 
@@ -3453,10 +3673,6 @@ function resolveSelectedMail() {
 }
 
 
-// ============================================================
-// 復原中斷的日曆異動
-// ============================================================
-
 function recoverSelectedCalendar() {
   locked_(() => {
     const c = selected_();
@@ -3498,13 +3714,6 @@ function recoverSelectedCalendar() {
 }
 
 
-// ============================================================
-// 人工已恢復原班後，驗證快照並解除鎖定
-//
-// 這不是略過檢查。
-// 原班仍不符合快照，就不允許解除。
-// ============================================================
-
 function confirmSelectedRecovery() {
   const ui = SpreadsheetApp.getUi();
 
@@ -3539,6 +3748,7 @@ function confirmSelectedRecovery() {
     );
 
     checkDependents_(
+      c,
       st.plans.map(p => p.token),
       events
     );
@@ -3578,6 +3788,113 @@ function confirmSelectedRecovery() {
     finishRestore_(
       c,
       st
+    );
+  });
+}
+
+
+function cleanSelectedCalendarDisplay() {
+  locked_(() => {
+    const c = selected_();
+    const st = state_(c);
+
+    if (
+      !st ||
+      st.phase !== ACTIVE_PHASE
+    ) {
+      throw new Error(
+        "請選擇已成功更新日曆、尚未取消的申請列。"
+      );
+    }
+
+    const calendar = getCalendar_();
+    const events = eventsForTx_(
+      calendar,
+      st
+    );
+
+    assertAppliedIntact_(
+      c,
+      st,
+      events
+    );
+
+    const targets = [];
+
+    for (const p of st.plans) {
+      targets.push(
+        mainEvent_(p, events)
+      );
+
+      for (const addition of p.additions) {
+        const event = addedEvent_(
+          addition,
+          events
+        );
+
+        if (event) {
+          targets.push(event);
+        }
+      }
+    }
+
+    const unique = [];
+    const seen = new Set();
+
+    targets.forEach(event => {
+      const key =
+        event.getId() + "|" +
+        event.getStartTime().getTime();
+
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(event);
+      }
+    });
+
+    let changed = 0;
+
+    for (const event of unique) {
+      const logicalBefore = snap_(event);
+      const rawBefore = event.getDescription() || "";
+
+      const oldTagRow =
+        event.getTag(EVENT_TAGS.ROW_ID);
+
+      const oldTagPart =
+        event.getTag(EVENT_TAGS.PART_ID);
+
+      putSnapshot_(
+        event,
+        logicalBefore
+      );
+
+      if (
+        rawBefore !== event.getDescription() ||
+        oldTagRow !== event.getTag(EVENT_TAGS.ROW_ID) ||
+        oldTagPart !== event.getTag(EVENT_TAGS.PART_ID)
+      ) {
+        changed++;
+      }
+
+      if (
+        !same_(
+          snap_(event),
+          logicalBefore
+        )
+      ) {
+        throw new Error(
+          "清理後核對失敗，已停止；請檢查日曆。"
+        );
+      }
+    }
+
+    c.s.getParent().toast(
+      changed > 0
+        ? "已清理 " +
+          changed +
+          " 個日曆行程的系統代碼；班表內容未改變。"
+        : "這筆申請的日曆顯示已經是乾淨格式。"
     );
   });
 }
